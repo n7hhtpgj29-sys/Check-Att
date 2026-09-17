@@ -1,11 +1,11 @@
 {
-  "name": "CAL-COMP Attendance & Manpower",
+  "name": "CAL-COMP Attendance Mobile",
   "short_name": "CC Attendance",
-  "description": "Mobile attendance and manpower dashboard",
+  "description": "Mobile attendance and manpower dashboard with cloud query and missing recheck",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#f4f7f9",
+  "background_color": "#f3f6f8",
   "theme_color": "#ffffff",
   "orientation": "portrait-primary",
   "icons": [

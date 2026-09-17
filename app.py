@@ -6,7 +6,7 @@ from flask import Flask,jsonify,render_template,request,send_from_directory
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 BASE=Path(__file__).resolve().parent; DATA=BASE/'data'; DATA.mkdir(exist_ok=True); DB=DATA/'attendance.db'; TARGET='https://webapp.calcomp.co.th/att/'
-app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=20*1024*1024; jobs={}; lock=threading.Lock()
+app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=20*1024*1024; jobs={}; lock=threading.Lock(); query_run_lock=threading.Lock(); STARTED_AT=datetime.now().isoformat(timespec='seconds')
 def log(msg): print(f'[ATT] {datetime.now().isoformat(timespec="seconds")} {msg}', flush=True)
 def db(): c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 def init():
@@ -106,6 +106,9 @@ def query_once(page,emp,group="",shift="D",timeout=12,requested_work_date=None):
 def setjob(j,**kw):
  with lock:jobs[j].update(kw)
 def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False):
+ if not query_run_lock.acquire(blocking=False):
+  setjob(j,status='error',current='',message='Another query is already running. Please wait.')
+  return
  try:
   with db() as c:
    sql='SELECT * FROM employees WHERE active=1'; args=[]
@@ -152,12 +155,15 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False):
  except Exception as e:
   log(f'JOB ERROR {type(e).__name__}: {e}')
   setjob(j,status='error',current='',message=f'{type(e).__name__}: {e}')
+ finally:
+  try: query_run_lock.release()
+  except RuntimeError: pass
 @app.get('/manifest.webmanifest')
 def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',mimetype='application/manifest+json')
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version='5.1-iphone-pwa-cloud-headed',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''))
+def health(): return jsonify(ok=True,version='6.0-mobile-final',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
 @app.get('/')
 def home():return render_template('index.html')
 @app.get('/api/dashboard')
@@ -219,6 +225,70 @@ def upload():
  finally:
   try:path.unlink(missing_ok=True)
   except:pass
+
+
+@app.get('/api/state/export')
+def state_export():
+ with db() as c:
+  employees=[dict(x) for x in c.execute('SELECT employee_code,full_name,location_support,team_support,group_code,shift,active,updated_at FROM employees ORDER BY active DESC,shift,location_support,employee_code')]
+  attendance=[dict(x) for x in c.execute('SELECT employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date FROM attendance ORDER BY employee_code')]
+ return jsonify(ok=True,version=1,exported_at=datetime.now().isoformat(timespec='seconds'),employees=employees,attendance=attendance)
+
+@app.post('/api/state/restore')
+def state_restore():
+ x=request.get_json(silent=True) or {}; rows=x.get('employees'); att=x.get('attendance') or []
+ if not isinstance(rows,list) or not rows: return jsonify(ok=False,error='employees must be a non-empty array'),400
+ now=datetime.now().isoformat(timespec='seconds'); incoming={}
+ for r in rows:
+  if not isinstance(r,dict): continue
+  emp=re.sub(r'<[^>]+>','',clean(r.get('employee_code'))).strip().upper()
+  if not emp: continue
+  incoming[emp]=(clean(r.get('full_name')),clean(r.get('location_support')),clean(r.get('team_support')),clean(r.get('group_code')).upper(),clean(r.get('shift')).upper(),1 if r.get('active',True) else 0)
+ if not incoming: return jsonify(ok=False,error='No valid employee records'),400
+ with db() as c:
+  c.execute('DELETE FROM employees'); c.execute('DELETE FROM attendance')
+  for emp,(name,loc,team,grp,sh,active) in incoming.items():
+   c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?)',(emp,name,'','',active,now,loc,team,grp,sh))
+  for r in att:
+   if not isinstance(r,dict): continue
+   emp=clean(r.get('employee_code')).upper()
+   if emp not in incoming: continue
+   c.execute('INSERT INTO attendance(employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(emp,clean(r.get('name_from_web')),clean(r.get('latest_datetime')),clean(r.get('status')),clean(r.get('query_at')),clean(r.get('scan_in')),clean(r.get('scan_out')),int(r.get('raw_count') or 0),int(r.get('ot_minutes') or 0),clean(r.get('work_date'))))
+ return jsonify(ok=True,total=len(incoming),attendance=len(att))
+
+@app.get('/api/master/export')
+def master_export():
+ with db() as c:
+  rows=[dict(x) for x in c.execute('SELECT employee_code,full_name,location_support,team_support,group_code,shift,active,updated_at FROM employees ORDER BY active DESC,shift,location_support,employee_code')]
+ return jsonify(ok=True,version=1,exported_at=datetime.now().isoformat(timespec='seconds'),employees=rows)
+
+@app.post('/api/master/replace')
+def master_replace():
+ x=request.get_json(silent=True) or {}; rows=x.get('employees')
+ if not isinstance(rows,list): return jsonify(ok=False,error='employees must be an array'),400
+ incoming={}
+ for r in rows:
+  if not isinstance(r,dict): continue
+  emp=re.sub(r'<[^>]+>','',clean(r.get('employee_code'))).strip().upper()
+  if not emp: continue
+  incoming[emp]={
+   'employee_code':emp,
+   'full_name':clean(r.get('full_name')),
+   'location_support':clean(r.get('location_support')),
+   'team_support':clean(r.get('team_support')),
+   'group_code':clean(r.get('group_code')).upper(),
+   'shift':clean(r.get('shift')).upper(),
+   'active':1 if r.get('active',True) else 0
+  }
+ if not incoming: return jsonify(ok=False,error='No valid employee records'),400
+ now=datetime.now().isoformat(timespec='seconds')
+ with db() as c:
+  c.execute('UPDATE employees SET active=0,updated_at=?',(now,))
+  sql="INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift"
+  for r in incoming.values():
+   c.execute(sql,(r['employee_code'],r['full_name'],'','',r['active'],now,r['location_support'],r['team_support'],r['group_code'],r['shift']))
+ return jsonify(ok=True,total=len(incoming),active=sum(r['active'] for r in incoming.values()))
+
 @app.get('/api/employees')
 def employee_list():
  with db() as c:return jsonify(ok=True,employees=[dict(x) for x in c.execute('SELECT * FROM employees ORDER BY active DESC,location_support,employee_code')])
@@ -239,6 +309,10 @@ def start():
   query_shift=clean(x.get('shift')).upper() if clean(x.get('shift')).upper() in ('D','N') else 'ALL'
   try: wd=datetime.strptime(clean(x.get('work_date')),'%Y-%m-%d').date() if x.get('work_date') else None
   except: wd=None
+ if query_run_lock.locked():
+  with lock:
+   active=next((jid for jid,v in jobs.items() if v.get('status') in ('queued','running')),None)
+  return jsonify(ok=False,error='Another query is already running',job_id=active),409
  j=uuid.uuid4().hex[:10]
  missing_only=bool(x.get('missing_only',False))
  with lock:jobs[j]={'status':'queued','total':0,'done':0,'current':'','message':'Preparing missing employees...' if missing_only else 'Preparing...','query_shift':query_shift,'work_date':wd.isoformat() if wd else '','missing_only':missing_only}
