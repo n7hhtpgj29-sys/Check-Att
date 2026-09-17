@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: cc-attendance-iphone-pwa
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: PLAYWRIGHT_HEADLESS
+        value: "1"
