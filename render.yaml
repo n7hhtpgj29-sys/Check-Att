@@ -2,7 +2,7 @@ services:
   - type: web
     name: cc-attendance-iphone-pwa
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
     autoDeploy: true
     healthCheckPath: /api/health
