@@ -163,7 +163,7 @@ def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version='7.0-mobile-latest-only',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
+def health(): return jsonify(ok=True,version='8.0-mobile-list-scroll-fix',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
 @app.get('/')
 def home():return render_template('index.html')
 @app.get('/api/dashboard')
