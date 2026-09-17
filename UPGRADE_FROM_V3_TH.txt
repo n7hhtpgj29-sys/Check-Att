@@ -1,14 +1,13 @@
-อัปเกรดจาก v3 ที่กำลังใช้งานอยู่
-================================
+อัปเกรดเป็น Mobile Final v7 — Latest Only
+1) Backup Employee Master ก่อนอัปเดต ถ้าต้องการ
+2) อัปโหลดไฟล์ชุดนี้ทับ GitHub repo เดิม
+3) Commit changes
+4) รอ Render Auto Deploy จน Live
+5) เปิด /api/health และตรวจว่า version = 7.0-mobile-latest-only
+6) ถ้า iPhone ยังเห็นหน้าจอเก่า ให้ปิด PWA แล้วเปิดใหม่ หรือ Reload Safari 1 ครั้งเพื่อรับ Service Worker ใหม่
 
-สำคัญ: Render Free ใช้ ephemeral filesystem ดังนั้น SQLite เดิมอาจหายตอน Deploy v6
-ก่อนอัปเดต ควรเก็บไฟล์ Excel Employee Master ไว้
-
-หลัง Deploy v6 ครั้งแรก:
-1) เปิดแอป
-2) ถ้า Total HC = 0 ให้ Upload Employee Master Excel อีก 1 ครั้ง
-3) เปิด Master แล้วกด BACKUP TO IPHONE หรือกด Settings > Backup now
-4) หลังจากนั้น v6 จะสำรอง Employee Master + Attendance state อัตโนมัติทุกครั้งหลัง Query สำเร็จ
-5) ถ้า Render sleep/restart แอปจะ Restore state จาก iPhone อัตโนมัติ
-
-ถ้าใช้ iPhone เครื่องใหม่ ให้ Export JSON จากเครื่องเดิม แล้ว Import JSON ในเครื่องใหม่
+สิ่งที่เปลี่ยน:
+- ตัด Custom Date / Query Custom / Historical Query
+- เพิ่มป้าย Latest only
+- คง TODAY DAY / LAST NIGHT / TONIGHT / RECHECK MISSING ONLY
+- เปลี่ยน localStorage key เป็น v7 เพื่อไม่ดึง Custom Query เก่ากลับมา

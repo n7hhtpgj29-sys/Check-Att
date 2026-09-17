@@ -1,7 +1,7 @@
 {
   "name": "CAL-COMP Attendance Mobile",
   "short_name": "CC Attendance",
-  "description": "Mobile attendance and manpower dashboard with cloud query and missing recheck",
+  "description": "Mobile attendance and manpower dashboard for latest attendance only, with cloud query and missing recheck",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

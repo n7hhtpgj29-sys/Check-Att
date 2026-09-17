@@ -163,7 +163,7 @@ def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version='6.0-mobile-final',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
+def health(): return jsonify(ok=True,version='7.0-mobile-latest-only',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
 @app.get('/')
 def home():return render_template('index.html')
 @app.get('/api/dashboard')
@@ -301,14 +301,12 @@ def employee_save():
  return jsonify(ok=True)
 @app.post('/api/query')
 def start():
- x=request.get_json(silent=True) or {}; mode=clean(x.get('mode')).upper() or 'ALL'; today=date.today()
+ x=request.get_json(silent=True) or {}; mode=clean(x.get('mode')).upper() or 'DAY'; today=date.today()
+ # Mobile v7 is intentionally latest-only. Historical/custom-date queries are disabled.
  if mode=='DAY': query_shift='D'; wd=today
  elif mode=='LAST_NIGHT': query_shift='N'; wd=today-timedelta(days=1)
  elif mode=='TONIGHT': query_shift='N'; wd=today
- else:
-  query_shift=clean(x.get('shift')).upper() if clean(x.get('shift')).upper() in ('D','N') else 'ALL'
-  try: wd=datetime.strptime(clean(x.get('work_date')),'%Y-%m-%d').date() if x.get('work_date') else None
-  except: wd=None
+ else: return jsonify(ok=False,error='Historical/custom-date query is disabled in Mobile v7. Use TODAY DAY, LAST NIGHT, or TONIGHT.'),400
  if query_run_lock.locked():
   with lock:
    active=next((jid for jid,v in jobs.items() if v.get('status') in ('queued','running')),None)
