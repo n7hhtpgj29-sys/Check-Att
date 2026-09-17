@@ -8,4 +8,6 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: PLAYWRIGHT_HEADLESS
-        value: "1"
+        value: "0"
+      - key: TZ
+        value: "Asia/Bangkok"

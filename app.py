@@ -7,6 +7,7 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 BASE=Path(__file__).resolve().parent; DATA=BASE/'data'; DATA.mkdir(exist_ok=True); DB=DATA/'attendance.db'; TARGET='https://webapp.calcomp.co.th/att/'
 app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=20*1024*1024; jobs={}; lock=threading.Lock()
+def log(msg): print(f'[ATT] {datetime.now().isoformat(timespec="seconds")} {msg}', flush=True)
 def db(): c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 def init():
  with db() as c:
@@ -95,7 +96,12 @@ def query_once(page,emp,group="",shift="D",timeout=12,requested_work_date=None):
   except:pass
   page.wait_for_timeout(300)
  sel,status,name,ins,outs,ot_minutes,work_date=choose(rs,emp,group,shift,requested_work_date)
- if not sel:return {'latest_datetime':'','status':'QUERY UNAVAILABLE','name_from_web':'','scan_in':'','scan_out':'','raw_count':0,'ot_minutes':0,'work_date':''}
+ if not sel:
+  try:
+   body=re.sub(r'\s+',' ',page.locator('body').inner_text())[:300]
+   log(f'NO ROWS emp={emp} url={page.url} title={page.title()} rows={len(rs)} body={body}')
+  except Exception as e: log(f'NO ROWS emp={emp} debug_error={type(e).__name__}: {e}')
+  return {'latest_datetime':'','status':'QUERY UNAVAILABLE','name_from_web':'','scan_in':'','scan_out':'','raw_count':0,'ot_minutes':0,'work_date':''}
  return {'latest_datetime':sel.strftime('%d/%m/%Y %H:%M:%S'),'status':status,'name_from_web':name,'scan_in':ins[0].strftime('%d/%m/%Y %H:%M:%S') if ins else '','scan_out':outs[0].strftime('%d/%m/%Y %H:%M:%S') if outs else '','raw_count':len(ins)+len(outs),'ot_minutes':ot_minutes,'work_date':work_date}
 def setjob(j,**kw):
  with lock:jobs[j].update(kw)
@@ -117,11 +123,15 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False):
    emps=[dict(x) for x in c.execute(sql,args)]
   setjob(j,status='running',total=len(emps),done=0,message='Checking attendance...'); results={}; failed=[]
   with sync_playwright() as p:
-   browser=p.chromium.launch(headless=os.getenv('PLAYWRIGHT_HEADLESS','1')!='0', args=['--no-sandbox','--disable-dev-shm-usage']); ctx=browser.new_context(ignore_https_errors=True, viewport={'width':390,'height':844}); page=ctx.new_page()
+   headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0'
+   log(f'launch chromium headless={headless} display={os.getenv("DISPLAY","")} target={TARGET}')
+   browser=p.chromium.launch(headless=headless, args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']); ctx=browser.new_context(ignore_https_errors=True, viewport={'width':1280,'height':900}, locale='en-US', timezone_id='Asia/Bangkok', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'); ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"); page=ctx.new_page()
    for i,e in enumerate(emps,1):
     emp=e['employee_code']; setjob(j,current=emp,done=i-1,message=f'Query {emp}')
     try:r=query_once(page,emp,e.get('group_code',''),e.get('shift','D'),requested_work_date=requested_work_date)
-    except:r={'latest_datetime':'','status':'QUERY UNAVAILABLE','name_from_web':'','scan_in':'','scan_out':'','raw_count':0}
+    except Exception as ex:
+     log(f'QUERY ERROR emp={emp} {type(ex).__name__}: {ex}')
+     r={'latest_datetime':'','status':'QUERY UNAVAILABLE','name_from_web':'','scan_in':'','scan_out':'','raw_count':0,'ot_minutes':0,'work_date':''}
     results[emp]=r
     if r['status']=='QUERY UNAVAILABLE':failed.append(emp)
     setjob(j,done=i); time.sleep(.6)
@@ -129,7 +139,7 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False):
     for k,emp in enumerate(failed,1):
      setjob(j,current=emp,message=f'Retry {k}/{len(failed)}: {emp}')
      try:page.wait_for_timeout(1500); ee=next((x for x in emps if x['employee_code']==emp),{}); results[emp]=query_once(page,emp,ee.get('group_code',''),ee.get('shift','D'),15,requested_work_date)
-     except:pass
+     except Exception as ex: log(f'RETRY ERROR emp={emp} {type(ex).__name__}: {ex}')
    ctx.close(); browser.close()
   now=datetime.now().strftime('%d/%m/%Y %H:%M:%S')
   with db() as c:
@@ -139,13 +149,15 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False):
    setjob(j,status='done',current='',done=len(emps),total=len(emps),message=f'Rechecked {len(emps)} employee(s) • {newly_present} present')
   else:
    setjob(j,status='done',current='',done=len(emps),total=len(emps),message='Attendance updated')
- except Exception as e:setjob(j,status='error',current='',message=f'{type(e).__name__}: {e}')
+ except Exception as e:
+  log(f'JOB ERROR {type(e).__name__}: {e}')
+  setjob(j,status='error',current='',message=f'{type(e).__name__}: {e}')
 @app.get('/manifest.webmanifest')
 def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',mimetype='application/manifest+json')
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version='5.0-iphone-pwa-cloud',target=TARGET)
+def health(): return jsonify(ok=True,version='5.1-iphone-pwa-cloud-headed',target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''))
 @app.get('/')
 def home():return render_template('index.html')
 @app.get('/api/dashboard')
