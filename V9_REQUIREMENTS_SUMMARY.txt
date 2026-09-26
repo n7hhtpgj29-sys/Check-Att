@@ -1,0 +1,15 @@
+Multi Department v9 — implemented requirements
+
+1. One server / one URL for multiple departments.
+2. Department selector: ALL / PE / QA / MFG / IT / additional department codes.
+3. Query is isolated by Department + Day/Night shift.
+4. Recheck Missing is isolated to the last query of the currently selected Department.
+5. Upload Employee Master updates only the selected Department.
+6. Department-scoped local iPhone backup/restore prevents one department overwriting another.
+7. ALL DEPARTMENTS mode is view-only for summary; Query requires one specific Department.
+8. Existing v8 employees with blank department migrate automatically to PE.
+9. Employee Status tables support clickable header sorting.
+10. Quick Sort: Default, No Scan First, Present First, Scan In Latest.
+11. Mobile detail list/scroll fix from v8 retained.
+12. Historical/custom date query remains disabled (latest only).
+13. If two departments start a Query at the same time, jobs queue and run sequentially on the shared server instead of overwriting each other.

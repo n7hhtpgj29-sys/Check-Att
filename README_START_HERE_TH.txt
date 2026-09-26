@@ -1,22 +1,38 @@
-CAL-COMP Attendance iPhone PWA — Mobile Final v7 (Latest Only)
+CAL-COMP Attendance & Manpower — Multi Department v9
+======================================================
 
-เวอร์ชันนี้ตัด Custom / Historical Date Query ออกจากมือถือแล้วตามการใช้งานจริง
+แนวคิดหลัก
+- ใช้ Render Server / URL เดียวกัน
+- แยกข้อมูลตาม Department เช่น PE / QA / MFG / IT
+- แต่ละ Department มี Employee Master, Day/Night Query, Backup และ Recheck Missing ของตัวเอง
+- Dashboard สามารถเลือก ALL DEPARTMENTS เพื่อดูภาพรวมได้ แต่การ Query ต้องเลือก Department เดียวก่อนเสมอ
 
-ใช้งานหลัก:
-- TODAY DAY = Query กะกลางวันของวันนี้
-- LAST NIGHT = Query กะกลางคืนล่าสุดที่จบ/กำลังใช้สำหรับรายงาน
-- TONIGHT = Query กะกลางคืนของคืนนี้
-- RECHECK MISSING ONLY = Query ซ้ำเฉพาะพนักงานที่ยังไม่ Present จาก Query ล่าสุด
+การอัปเกรดจาก v8
+1) อัปโหลดไฟล์ v9 ทับไฟล์เดิมใน GitHub แล้ว Commit
+2) Render จะ Auto Deploy
+3) เปิด /api/health ต้องเห็น version = 9.0-multi-department
+4) Employee Master เดิมที่ department ว่าง จะถูกย้ายเป็น PE อัตโนมัติ
+5) เพิ่ม Department ใหม่ด้วยปุ่ม + DEPARTMENT
+6) เลือก Department แล้ว Upload Employee Master ของแผนกนั้น
+   - ไฟล์ Excel ไม่ต้องมีคอลัมน์ department
+   - ระบบจะผูกทั้งไฟล์กับ Department ที่เลือก
+   - การ Upload PE จะไม่ปิด/ลบพนักงาน QA, MFG, IT
 
-ไม่มีช่องเลือกวันที่ย้อนหลัง และ API จะปฏิเสธ Custom Date Query
+Sorting Table
+- กดหัวคอลัมน์เพื่อเรียง Ascending / Descending
+- Quick Sort: Default / No Scan First / Present First / Scan In Latest
+- Sorting ทำเฉพาะข้อมูลที่กำลัง Filter อยู่
 
-Deploy: อัปโหลดไฟล์ทั้งหมดทับ Repo เดิมบน GitHub แล้ว Commit; Render Auto Deploy จะทำงานเอง
-Health check: /api/health ต้องแสดง version 7.0-mobile-latest-only
+Backup บน iPhone
+- Backup ถูกแยกตาม Department
+- PE backup ไม่สามารถ overwrite QA master ได้
+- ถ้า Render Free restart ให้เปิด Department นั้นจาก iPhone ที่มี backup เพื่อ restore เฉพาะแผนก
 
+ข้อควรทราบ
+- Render Free ใช้ SQLite แบบชั่วคราว ข้อมูลอาจหายเมื่อ service restart/deploy
+- ถ้าจะใช้หลาย Department แบบ production จริง แนะนำย้ายฐานข้อมูลไป PostgreSQL/Persistent DB ใน version ถัดไป
+- v9 ยังไม่ได้ใส่ Login/Role permission ดังนั้นผู้ที่เข้าถึง URL สามารถเลือก Department ได้ทั้งหมด
 
-V8 Mobile List Fix:
-- Modal รายชื่อบน iPhone เปลี่ยนเป็น Card List
-- Scroll ภายใน Modal ได้ครบทุกคน
-- Modal อยู่เหนือ bottom navigation
-- รองรับรายชื่อ 9, 20+ คนโดยไม่ตกขอบ
-- Health version: 8.0-mobile-list-scroll-fix
+Health check
+https://<your-render-url>/api/health
+Expected: "version": "9.0-multi-department"
