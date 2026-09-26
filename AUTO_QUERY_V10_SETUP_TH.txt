@@ -1,0 +1,37 @@
+CAL-COMP Attendance Multi Department v10 — AUTO QUERY
+=====================================================
+
+Auto Query ทำงานฝั่ง Cloud ผ่าน GitHub Actions
+ไม่ต้องเปิด iPhone / Safari / PWA ค้างไว้ และช่วยปลุก Render Free ก่อน Query
+
+เวลา (Asia/Bangkok)
+- 08:15  -> TODAY DAY
+- 18:00  -> TODAY DAY
+- 20:15  -> TONIGHT
+- 06:00  -> LAST NIGHT (เป็น Final Check ของกะดึกที่เริ่มจากคืนก่อน)
+
+ระบบจะ Query ทุก Department ที่ Active แบบทีละแผนก เพื่อไม่ให้ Chromium ชนกัน
+เช่น PE -> QA -> MFG -> IT
+
+วิธีติดตั้ง
+1. อัปโหลดไฟล์ v10 ทั้งหมดทับ Repo GitHub เดิม แล้ว Commit
+2. Render จะ Auto Deploy ตามปกติ
+3. เปิด /api/health ต้องเห็น version = 10.0-multi-department-auto-query
+4. เข้า GitHub Repo -> Actions -> Attendance Auto Query
+5. ถ้า GitHub ถาม ให้ Enable Actions / I understand my workflows
+6. สามารถกด Run workflow แล้วเลือก DAY เพื่อทดสอบทันที
+
+URL
+Workflow มี fallback URL ของระบบปัจจุบัน:
+https://cc-attendance-iphone-pwa.onrender.com
+ถ้าเปลี่ยน Render URL ให้ตั้ง GitHub Repository Variable:
+Settings -> Secrets and variables -> Actions -> Variables -> New repository variable
+Name: ATTENDANCE_BASE_URL
+Value: https://<your-service>.onrender.com
+
+หมายเหตุ
+- GitHub scheduled workflow ใช้ UTC แต่ไฟล์นี้แปลงเวลาไทยไว้แล้ว
+- GitHub อาจเริ่ม Scheduled Action ช้ากว่าเวลาที่ตั้งไม่กี่นาทีในบางช่วง
+- 06:00 ใช้ LAST_NIGHT โดยตั้งใจ เพื่อสรุปกะดึกที่เริ่มจากคืนก่อนหน้า
+- Workflow Query ทุก Department ที่อยู่ใน /api/departments
+- Query จะรอ Department ก่อนหน้าจบก่อน แล้วจึงทำ Department ถัดไป

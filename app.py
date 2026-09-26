@@ -1,16 +1,27 @@
 from __future__ import annotations
-import os,re,sqlite3,threading,time,uuid
+import os,re,sqlite3,threading,time,uuid,json
+from zoneinfo import ZoneInfo
 from datetime import datetime,date,time as dtime,timedelta
 from pathlib import Path
 from flask import Flask,jsonify,render_template,request,send_from_directory
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
+try:
+ import psycopg
+ from psycopg.rows import dict_row
+except Exception:
+ psycopg=None
+ dict_row=None
 
 BASE=Path(__file__).resolve().parent
 DATA=BASE/'data'; DATA.mkdir(exist_ok=True)
 DB=DATA/'attendance.db'
 TARGET='https://webapp.calcomp.co.th/att/'
-VERSION='9.0-multi-department'
+VERSION='11.0-maintainable-auto-query'
+BKK=ZoneInfo('Asia/Bangkok')
+DATABASE_URL=os.getenv('DATABASE_URL','').strip()
+AUTO_QUERY_TOKEN=os.getenv('AUTO_QUERY_TOKEN','').strip()
+AUTO_GRACE_MINUTES=int(os.getenv('AUTO_GRACE_MINUTES','180'))
 app=Flask(__name__)
 app.config['MAX_CONTENT_LENGTH']=20*1024*1024
 jobs={}; lock=threading.Lock(); query_run_lock=threading.Lock()
@@ -45,12 +56,207 @@ def init():
    if d:c.execute('INSERT OR IGNORE INTO departments(code,name,active,updated_at) VALUES(?,?,1,?)',(d,d,now))
 init()
 
+# ---------------------------
+# V11 persistent auto-schedule store
+# ---------------------------
+DEFAULT_AUTO_SCHEDULE={
+ 'enabled':1,
+ 'weekdays':'0,1,2,3,4,5,6', # Monday=0 ... Sunday=6
+ 'day1_time':'08:15',
+ 'day2_time':'18:00',
+ 'night1_time':'20:15',
+ 'night_final_time':'06:00',
+}
+AUTO_SLOTS=(
+ ('day1','day1_time','DAY','TODAY DAY'),
+ ('day2','day2_time','DAY','TODAY DAY'),
+ ('night1','night1_time','TONIGHT','TONIGHT'),
+ ('night_final','night_final_time','LAST_NIGHT','NIGHT FINAL'),
+)
+
+def bkk_now(): return datetime.now(BKK)
+def schedule_store_kind(): return 'postgres' if DATABASE_URL and psycopg else 'sqlite'
+
+def _pg_conn():
+ if not (DATABASE_URL and psycopg): return None
+ return psycopg.connect(DATABASE_URL,row_factory=dict_row,connect_timeout=10)
+
+def init_auto_store():
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute("""CREATE TABLE IF NOT EXISTS auto_schedules(
+      department TEXT PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      weekdays TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
+      day1_time TEXT NOT NULL DEFAULT '08:15',
+      day2_time TEXT NOT NULL DEFAULT '18:00',
+      night1_time TEXT NOT NULL DEFAULT '20:15',
+      night_final_time TEXT NOT NULL DEFAULT '06:00',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS auto_query_runs(
+      department TEXT NOT NULL,
+      slot_key TEXT NOT NULL,
+      slot_date DATE NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'claimed',
+      job_id TEXT DEFAULT '',
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ,
+      message TEXT DEFAULT '',
+      PRIMARY KEY(department,slot_key,slot_date))""")
+  return
+ with db() as c:
+  c.execute("""CREATE TABLE IF NOT EXISTS auto_schedules(
+    department TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,
+    weekdays TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
+    day1_time TEXT NOT NULL DEFAULT '08:15',day2_time TEXT NOT NULL DEFAULT '18:00',
+    night1_time TEXT NOT NULL DEFAULT '20:15',night_final_time TEXT NOT NULL DEFAULT '06:00',
+    updated_at TEXT NOT NULL DEFAULT '')""")
+  c.execute("""CREATE TABLE IF NOT EXISTS auto_query_runs(
+    department TEXT NOT NULL,slot_key TEXT NOT NULL,slot_date TEXT NOT NULL,mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'claimed',job_id TEXT DEFAULT '',started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT DEFAULT '',message TEXT DEFAULT '',PRIMARY KEY(department,slot_key,slot_date))""")
+
+def ensure_auto_schedule(dept):
+ d=norm_dept(dept)
+ if not d:return
+ now=bkk_now().isoformat(timespec='seconds')
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute("""INSERT INTO auto_schedules(department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at)
+      VALUES(%s,TRUE,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(department) DO NOTHING""",
+      (d,DEFAULT_AUTO_SCHEDULE['weekdays'],DEFAULT_AUTO_SCHEDULE['day1_time'],DEFAULT_AUTO_SCHEDULE['day2_time'],DEFAULT_AUTO_SCHEDULE['night1_time'],DEFAULT_AUTO_SCHEDULE['night_final_time']))
+  return
+ with db() as c:
+  c.execute("""INSERT OR IGNORE INTO auto_schedules(department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)""",(d,1,DEFAULT_AUTO_SCHEDULE['weekdays'],DEFAULT_AUTO_SCHEDULE['day1_time'],DEFAULT_AUTO_SCHEDULE['day2_time'],DEFAULT_AUTO_SCHEDULE['night1_time'],DEFAULT_AUTO_SCHEDULE['night_final_time'],now))
+
+def get_auto_schedule(dept):
+ d=norm_dept(dept);ensure_auto_schedule(d)
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute('SELECT department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at FROM auto_schedules WHERE department=%s',(d,))
+    r=cur.fetchone()
+ else:
+  with db() as c:r=c.execute('SELECT department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at FROM auto_schedules WHERE department=?',(d,)).fetchone()
+ if not r:return None
+ x=dict(r);x['enabled']=bool(x.get('enabled'));x['weekdays']=[int(z) for z in str(x.get('weekdays') or '').split(',') if str(z).strip().isdigit()]
+ return x
+
+def _valid_hhmm(v):
+ try:
+  datetime.strptime(clean(v),'%H:%M');return True
+ except:return False
+
+def save_auto_schedule(dept,payload):
+ d=norm_dept(dept)
+ if not d:return None
+ times={k:clean(payload.get(k)) for k in ('day1_time','day2_time','night1_time','night_final_time')}
+ for k,v in times.items():
+  if not _valid_hhmm(v):raise ValueError(f'Invalid time for {k}: {v}. Use HH:MM')
+ weekdays=payload.get('weekdays',list(range(7)))
+ try:weekdays=sorted({int(x) for x in weekdays if 0<=int(x)<=6})
+ except:raise ValueError('weekdays must be 0..6')
+ if not weekdays:raise ValueError('Select at least one workday')
+ enabled=bool(payload.get('enabled',True));wd=','.join(map(str,weekdays));now=bkk_now().isoformat(timespec='seconds')
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute("""INSERT INTO auto_schedules(department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at)
+      VALUES(%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(department) DO UPDATE SET enabled=EXCLUDED.enabled,weekdays=EXCLUDED.weekdays,day1_time=EXCLUDED.day1_time,day2_time=EXCLUDED.day2_time,night1_time=EXCLUDED.night1_time,night_final_time=EXCLUDED.night_final_time,updated_at=NOW()""",
+      (d,enabled,wd,times['day1_time'],times['day2_time'],times['night1_time'],times['night_final_time']))
+ else:
+  with db() as c:c.execute("""INSERT INTO auto_schedules(department,enabled,weekdays,day1_time,day2_time,night1_time,night_final_time,updated_at)
+    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(department) DO UPDATE SET enabled=excluded.enabled,weekdays=excluded.weekdays,day1_time=excluded.day1_time,day2_time=excluded.day2_time,night1_time=excluded.night1_time,night_final_time=excluded.night_final_time,updated_at=excluded.updated_at""",
+    (d,1 if enabled else 0,wd,times['day1_time'],times['day2_time'],times['night1_time'],times['night_final_time'],now))
+ return get_auto_schedule(d)
+
+def last_auto_run(dept):
+ d=norm_dept(dept)
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute('SELECT department,slot_key,slot_date,mode,status,job_id,started_at,finished_at,message FROM auto_query_runs WHERE department=%s ORDER BY started_at DESC LIMIT 1',(d,));r=cur.fetchone()
+ else:
+  with db() as c:r=c.execute('SELECT department,slot_key,slot_date,mode,status,job_id,started_at,finished_at,message FROM auto_query_runs WHERE department=? ORDER BY started_at DESC LIMIT 1',(d,)).fetchone()
+ if not r:return None
+ x=dict(r)
+ for k in ('slot_date','started_at','finished_at'):
+  if x.get(k) is not None:x[k]=str(x[k])
+ return x
+
+def next_auto_run(sched,from_dt=None):
+ if not sched or not sched.get('enabled'):return None
+ now=from_dt or bkk_now();allowed=set(sched.get('weekdays') or [])
+ cand=[]
+ for off in range(0,8):
+  d=(now+timedelta(days=off)).date()
+  if d.weekday() not in allowed:continue
+  for slot,key,mode,label in AUTO_SLOTS:
+   hhmm=sched.get(key)
+   if not _valid_hhmm(hhmm):continue
+   tt=datetime.strptime(hhmm,'%H:%M').time();dt=datetime.combine(d,tt,tzinfo=BKK)
+   if dt>now:cand.append((dt,slot,mode,label))
+ if not cand:return None
+ dt,slot,mode,label=min(cand,key=lambda x:x[0]);return {'at':dt.isoformat(timespec='minutes'),'slot_key':slot,'mode':mode,'label':label}
+
+def _run_state(dept,slot_key,slot_date):
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute('SELECT * FROM auto_query_runs WHERE department=%s AND slot_key=%s AND slot_date=%s',(dept,slot_key,slot_date));r=cur.fetchone()
+ else:
+  with db() as c:r=c.execute('SELECT * FROM auto_query_runs WHERE department=? AND slot_key=? AND slot_date=?',(dept,slot_key,slot_date)).fetchone()
+ return dict(r) if r else None
+
+def claim_auto_run(dept,slot_key,slot_date,mode):
+ now=bkk_now();r=_run_state(dept,slot_key,slot_date)
+ if r:
+  status=clean(r.get('status')).lower()
+  if status=='done':return False
+  if status in ('claimed','running'):
+   try:
+    st=datetime.fromisoformat(str(r.get('started_at')))
+    if st.tzinfo is None:st=st.replace(tzinfo=BKK)
+    if (now-st).total_seconds()<3600:return False
+   except:pass
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:
+    cur.execute("""INSERT INTO auto_query_runs(department,slot_key,slot_date,mode,status,job_id,started_at,finished_at,message)
+      VALUES(%s,%s,%s,%s,'claimed','',NOW(),NULL,'') ON CONFLICT(department,slot_key,slot_date) DO UPDATE SET mode=EXCLUDED.mode,status='claimed',job_id='',started_at=NOW(),finished_at=NULL,message=''""",(dept,slot_key,slot_date,mode))
+ else:
+  with db() as c:c.execute("""INSERT INTO auto_query_runs(department,slot_key,slot_date,mode,status,job_id,started_at,finished_at,message)
+    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(department,slot_key,slot_date) DO UPDATE SET mode=excluded.mode,status='claimed',job_id='',started_at=excluded.started_at,finished_at='',message=''""",(dept,slot_key,slot_date,mode,'claimed','',now.isoformat(timespec='seconds'),'',''))
+ return True
+
+def complete_auto_run(dept,slot_key,slot_date,status,job_id='',message=''):
+ status='done' if clean(status).lower()=='done' else 'error';now=bkk_now().isoformat(timespec='seconds')
+ if schedule_store_kind()=='postgres':
+  with _pg_conn() as c:
+   with c.cursor() as cur:cur.execute('UPDATE auto_query_runs SET status=%s,job_id=%s,finished_at=NOW(),message=%s WHERE department=%s AND slot_key=%s AND slot_date=%s',(status,clean(job_id),clean(message)[:500],dept,slot_key,slot_date))
+ else:
+  with db() as c:c.execute('UPDATE auto_query_runs SET status=?,job_id=?,finished_at=?,message=? WHERE department=? AND slot_key=? AND slot_date=?',(status,clean(job_id),now,clean(message)[:500],dept,slot_key,slot_date))
+
+def auto_token_ok(req):
+ if not AUTO_QUERY_TOKEN:return False
+ return req.headers.get('X-Auto-Query-Token','')==AUTO_QUERY_TOKEN
+
+init_auto_store()
+with db() as _c:
+ for _r in _c.execute("SELECT code FROM departments WHERE active=1"):ensure_auto_schedule(_r[0])
+
 def ensure_department(code,name=None):
  d=norm_dept(code)
  if not d:return ''
  now=datetime.now().isoformat(timespec='seconds')
  with db() as c:
   c.execute('INSERT INTO departments(code,name,active,updated_at) VALUES(?,?,1,?) ON CONFLICT(code) DO UPDATE SET name=COALESCE(NULLIF(excluded.name,\'\'),departments.name),active=1,updated_at=excluded.updated_at',(d,clean(name) or d,now))
+ try: ensure_auto_schedule(d)
+ except Exception as e: log(f'AUTO SCHEDULE INIT ERROR dept={d} {type(e).__name__}: {e}')
  return d
 
 def normpos(v):
@@ -195,7 +401,7 @@ def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked())
+def health(): return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked(),schedule_store=schedule_store_kind(),persistent_schedule=(schedule_store_kind()=='postgres'),auto_query_token_configured=bool(AUTO_QUERY_TOKEN))
 @app.get('/')
 def home(): return render_template('index.html')
 
@@ -358,6 +564,51 @@ def employee_save():
  ensure_department(dept);now=datetime.now().isoformat(timespec='seconds')
  with db() as c:c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift',(emp,clean(x.get('full_name')),dept,'',1 if x.get('active',True) else 0,now,clean(x.get('location_support')),clean(x.get('team_support')),clean(x.get('group_code')).upper(),clean(x.get('shift')).upper()))
  return jsonify(ok=True,department=dept)
+
+@app.get('/api/auto-schedule')
+def auto_schedule_get():
+ dept=norm_dept(request.args.get('department',''))
+ if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
+ try:
+  sched=get_auto_schedule(dept);last=last_auto_run(dept);nxt=next_auto_run(sched)
+  return jsonify(ok=True,department=dept,schedule=sched,last_run=last,next_run=nxt,store=schedule_store_kind(),persistent=(schedule_store_kind()=='postgres'),token_configured=bool(AUTO_QUERY_TOKEN))
+ except Exception as e:
+  log(f'AUTO SCHEDULE GET ERROR dept={dept} {type(e).__name__}: {e}');return jsonify(ok=False,error=str(e)),500
+
+@app.post('/api/auto-schedule')
+def auto_schedule_save_api():
+ x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'))
+ if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
+ try:
+  ensure_department(dept);sched=save_auto_schedule(dept,x);return jsonify(ok=True,department=dept,schedule=sched,next_run=next_auto_run(sched),store=schedule_store_kind(),persistent=(schedule_store_kind()=='postgres'))
+ except Exception as e:return jsonify(ok=False,error=str(e)),400
+
+@app.post('/api/auto-query/tick')
+def auto_query_tick():
+ if not auto_token_ok(request):return jsonify(ok=False,error='Auto Query token missing or invalid'),401
+ now=bkk_now();tasks=[]
+ try:
+  with db() as c:deps=[norm_dept(x[0]) for x in c.execute("SELECT code FROM departments WHERE active=1 ORDER BY code")]
+  for dept in deps:
+   sched=get_auto_schedule(dept)
+   if not sched or not sched.get('enabled') or now.weekday() not in set(sched.get('weekdays') or []):continue
+   for slot_key,time_key,mode,label in AUTO_SLOTS:
+    hhmm=sched.get(time_key)
+    if not _valid_hhmm(hhmm):continue
+    due=datetime.combine(now.date(),datetime.strptime(hhmm,'%H:%M').time(),tzinfo=BKK)
+    age=(now-due).total_seconds()/60
+    if 0<=age<=AUTO_GRACE_MINUTES and claim_auto_run(dept,slot_key,now.date().isoformat(),mode):
+     tasks.append({'department':dept,'slot_key':slot_key,'slot_date':now.date().isoformat(),'mode':mode,'label':label,'scheduled_at':due.isoformat(timespec='minutes'),'late_minutes':int(age)})
+  return jsonify(ok=True,now=now.isoformat(timespec='minutes'),tasks=tasks,grace_minutes=AUTO_GRACE_MINUTES)
+ except Exception as e:
+  log(f'AUTO TICK ERROR {type(e).__name__}: {e}');return jsonify(ok=False,error=str(e)),500
+
+@app.post('/api/auto-query/complete')
+def auto_query_complete():
+ if not auto_token_ok(request):return jsonify(ok=False,error='Auto Query token missing or invalid'),401
+ x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'));slot=clean(x.get('slot_key'));slot_date=clean(x.get('slot_date'))
+ if not dept or not slot or not slot_date:return jsonify(ok=False,error='department, slot_key and slot_date required'),400
+ complete_auto_run(dept,slot,slot_date,x.get('status'),x.get('job_id'),x.get('message'));return jsonify(ok=True)
 
 @app.post('/api/query')
 def start():

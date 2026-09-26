@@ -1,0 +1,14 @@
+V11 REQUIREMENTS SUMMARY
+- One Render web service / one app URL
+- Multi Department: PE / QA / MFG / IT / more
+- Department-specific Employee Master and Day/Night query
+- Maintainable Auto Query schedule per Department in Settings
+- Enable/disable per Department
+- Select weekdays per Department
+- Four schedule slots per Department: Day #1, Day #2, Night Start, Night Final
+- Defaults: 08:15, 18:00, 20:15, 06:00 (Asia/Bangkok)
+- GitHub Actions wakes server every 5 minutes; server decides due tasks
+- Sequential Department queries; no simultaneous Chromium queries
+- Duplicate slot protection and retry-after-error behavior
+- Persistent schedule via PostgreSQL (DATABASE_URL), SQLite fallback for test
+- Sorting, latest-only UI, mobile modal scroll/list fixes retained from V9/V10

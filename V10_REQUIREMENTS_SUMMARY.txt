@@ -1,0 +1,11 @@
+V10 Multi Department + Scheduled Auto Query
+============================================
+1. One Render server / one PWA / multiple departments.
+2. Existing department scoped master/query/backup/sorting retained from v9.
+3. GitHub Actions runs server-side Auto Query at Thailand time:
+   08:15 DAY, 18:00 DAY, 20:15 TONIGHT, 06:00 LAST_NIGHT.
+4. Every active department is queried sequentially to avoid concurrent Chromium load.
+5. Render Free is awakened automatically by the workflow before querying.
+6. iPhone does not need to stay open or unlocked.
+7. Manual workflow_dispatch is included for testing DAY / TONIGHT / LAST_NIGHT.
+8. 06:00 intentionally uses LAST_NIGHT so the work date is the previous night shift.

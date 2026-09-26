@@ -1,0 +1,54 @@
+CC Attendance V11 — Multi Department + Maintainable Auto Query
+===============================================================
+
+สิ่งที่เพิ่มใน V11
+- แต่ละ Department ตั้งเวลา Auto Query ของตัวเองได้จาก Settings
+- เปิด/ปิด Auto Query แยก Department
+- เลือกวันทำงาน Mon-Sun แยก Department
+- เวลาแยก 4 ช่อง: DAY #1, DAY #2, NIGHT START, NIGHT FINAL
+- แสดง Last Auto Query / Next Auto Query
+- GitHub Actions ทำหน้าที่ปลุก Render ทุก 5 นาที แล้ว Server เป็นผู้ตัดสินว่า Department ไหนถึงเวลา
+- ป้องกัน Query ซ้ำใน slot เดียวกัน
+- ถ้างาน Auto Query error ระบบสามารถ retry ในรอบถัดไปได้
+
+ค่าเริ่มต้น Department ใหม่
+DAY #1     08:15 -> TODAY DAY
+DAY #2     18:00 -> TODAY DAY
+NIGHT START 20:15 -> TONIGHT
+NIGHT FINAL 06:00 -> LAST NIGHT
+Timezone: Asia/Bangkok
+
+สำคัญ: Persistent Schedule
+----------------------------
+เพื่อให้เวลาที่แต่ละ Department ตั้งไว้ไม่หายเมื่อ Render Free restart/sleep ให้ต่อ PostgreSQL และตั้ง DATABASE_URL บน Render Web Service
+ถ้าไม่ได้ตั้ง DATABASE_URL ระบบยังใช้งานได้ แต่จะขึ้นเตือน "SQLite fallback" และ Schedule อาจกลับค่า default เมื่อ filesystem ถูก reset
+
+Environment Variables บน Render Web Service
+1) DATABASE_URL = Internal Database URL ของ PostgreSQL
+2) AUTO_QUERY_TOKEN = สุ่มข้อความยาวอย่างน้อย 32 ตัวอักษร
+3) AUTO_GRACE_MINUTES = 180   (optional)
+
+GitHub Repository Secret
+- ATTENDANCE_AUTO_TOKEN = ค่าเดียวกับ AUTO_QUERY_TOKEN ใน Render
+
+GitHub Repository Variable (ถ้า URL เปลี่ยน)
+- ATTENDANCE_BASE_URL = https://<your-service>.onrender.com
+
+GitHub Actions
+- attendance-auto-query.yml รันทุก 5 นาที
+- ไม่ fix เวลา 08:15/18:00/20:15/06:00 ใน GitHub อีกแล้ว
+- เวลาแก้จากหน้า Settings ของแต่ละ Department เท่านั้น
+
+วิธีใช้งาน
+1) เลือก Department เช่น PE
+2) Settings
+3) เปิด Server Auto Query
+4) เลือก Mon-Sun
+5) ตั้งเวลา 4 ช่อง
+6) SAVE DEPARTMENT SCHEDULE
+7) เปลี่ยน Department เป็น QA/MFG/IT และตั้งเวลาแยกกันได้
+
+ตรวจสอบระบบ
+/api/health ต้องขึ้น version = 11.0-maintainable-auto-query
+persistent_schedule = true เมื่อ DATABASE_URL พร้อม
+auto_query_token_configured = true เมื่อ AUTO_QUERY_TOKEN พร้อม

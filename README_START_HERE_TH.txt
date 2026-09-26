@@ -1,4 +1,6 @@
-CAL-COMP Attendance & Manpower — Multi Department v9
+CC Attendance Multi Department V11 — Maintainable Auto Query
+
+CAL-COMP Attendance & Manpower — Multi Department v10 + Auto Query
 ======================================================
 
 แนวคิดหลัก
@@ -36,3 +38,12 @@ Backup บน iPhone
 Health check
 https://<your-render-url>/api/health
 Expected: "version": "9.0-multi-department"
+
+
+V11 Auto Query
+- 08:15 Today Day
+- 18:00 Today Day
+- 20:15 Tonight
+- 06:00 Last Night final check
+- ทำงานผ่าน .github/workflows/attendance-auto-query.yml
+- ไม่ต้องเปิด iPhone ค้างไว้
