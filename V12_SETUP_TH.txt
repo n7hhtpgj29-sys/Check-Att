@@ -1,0 +1,16 @@
+CC Attendance V12 — Live Auto Query Status + Duplicate Protection
+
+เพิ่มจาก V11
+- หน้าเว็บเห็น Auto/Manual Query ที่กำลังทำงาน แม้เปิดเว็บเข้ามาหลังงานเริ่มแล้ว
+- Header แสดง AUTO/MANUAL, Department, Mode และ Progress
+- แสดง Queue ของ Department อื่นที่กำลังรอ
+- หน้าเว็บ Poll /api/query-status ทุก 2 วินาที
+- Dashboard refresh อัตโนมัติหลัง Query จบ
+- ปุ่ม Query ของ Department ที่กำลังมีงานอยู่จะถูก disable
+- Backend ป้องกันการสร้างงานซ้ำสำหรับ Department + Mode + Work Date + Missing flag เดียวกัน
+- ถ้ากดซ้ำ API จะคืน job_id เดิมแทนการสร้าง Query ใหม่
+- GitHub Actions ส่ง source=AUTO เพื่อแยกจาก Manual Query ชัดเจน
+
+ตรวจสอบ
+/api/health -> version = 12.0-live-query-status
+/api/query-status -> ดู running / active / queued / recent

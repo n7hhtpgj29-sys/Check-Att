@@ -17,7 +17,7 @@ BASE=Path(__file__).resolve().parent
 DATA=BASE/'data'; DATA.mkdir(exist_ok=True)
 DB=DATA/'attendance.db'
 TARGET='https://webapp.calcomp.co.th/att/'
-VERSION='11.0-maintainable-auto-query'
+VERSION='12.0-live-query-status'
 BKK=ZoneInfo('Asia/Bangkok')
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 AUTO_QUERY_TOKEN=os.getenv('AUTO_QUERY_TOKEN','').strip()
@@ -339,7 +339,25 @@ def query_once(page,emp,group='',shift='D',timeout=12,requested_work_date=None):
  return {'latest_datetime':sel.strftime('%d/%m/%Y %H:%M:%S'),'status':status,'name_from_web':name,'scan_in':ins[0].strftime('%d/%m/%Y %H:%M:%S') if ins else '','scan_out':outs[0].strftime('%d/%m/%Y %H:%M:%S') if outs else '','raw_count':len(ins)+len(outs),'ot_minutes':ot_minutes,'work_date':work_date}
 
 def setjob(j,**kw):
- with lock: jobs[j].update(kw)
+ with lock:
+  if j in jobs: jobs[j].update(kw)
+
+def job_signature(department,mode,work_date,missing_only):
+ return (norm_dept(department),clean(mode).upper(),clean(work_date),bool(missing_only))
+
+def find_duplicate_job(department,mode,work_date,missing_only):
+ sig=job_signature(department,mode,work_date,missing_only)
+ with lock:
+  for jid,j in jobs.items():
+   if j.get('status') not in ('queued','running'): continue
+   jsig=job_signature(j.get('department'),j.get('mode'),j.get('work_date'),j.get('missing_only'))
+   if jsig==sig:
+    return jid,dict(j)
+ return '',None
+
+def job_public(jid,j):
+ x=dict(j);x['job_id']=jid
+ return x
 
 def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False,department='PE'):
  department=norm_dept(department)
@@ -358,9 +376,9 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False,dep
     sql+=" AND (a.employee_code IS NULL OR a.status IS NULL OR a.status!='PRESENT' OR COALESCE(a.work_date,'')!=?)";args.append(target_wd)
    sql+=' ORDER BY e.shift,e.location_support,e.team_support,e.employee_code'
    emps=[dict(x) for x in c.execute(sql,args)]
-  setjob(j,status='running',total=len(emps),done=0,message=f'Checking {department} attendance...');results={};failed=[]
+  setjob(j,status='running',total=len(emps),done=0,started_at=bkk_now().isoformat(timespec='seconds'),message=f'Checking {department} attendance...');results={};failed=[]
   if not emps:
-   setjob(j,status='done',total=0,done=0,current='',message=f'No active employees in {department} for this shift');return
+   setjob(j,status='done',total=0,done=0,current='',finished_at=bkk_now().isoformat(timespec='seconds'),message=f'No active employees in {department} for this shift');return
   with sync_playwright() as p:
    headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0'
    log(f'launch chromium headless={headless} display={os.getenv("DISPLAY","")} department={department} target={TARGET}')
@@ -389,9 +407,9 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False,dep
     c.execute('INSERT INTO attendance(employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET name_from_web=excluded.name_from_web,latest_datetime=excluded.latest_datetime,status=excluded.status,query_at=excluded.query_at,scan_in=excluded.scan_in,scan_out=excluded.scan_out,raw_count=excluded.raw_count,ot_minutes=excluded.ot_minutes,work_date=excluded.work_date',(emp,r['name_from_web'],r['latest_datetime'],r['status'],now,r.get('scan_in',''),r.get('scan_out',''),r.get('raw_count',0),r.get('ot_minutes',0),r.get('work_date','')))
   newly_present=sum(1 for r in results.values() if r.get('status')=='PRESENT')
   msg=f'{department} • Rechecked {len(emps)} employee(s) • {newly_present} present' if missing_only else f'{department} attendance updated'
-  setjob(j,status='done',current='',done=len(emps),total=len(emps),message=msg)
+  setjob(j,status='done',current='',done=len(emps),total=len(emps),finished_at=bkk_now().isoformat(timespec='seconds'),message=msg)
  except Exception as e:
-  log(f'JOB ERROR dept={department} {type(e).__name__}: {e}');setjob(j,status='error',current='',message=f'{type(e).__name__}: {e}')
+  log(f'JOB ERROR dept={department} {type(e).__name__}: {e}');setjob(j,status='error',current='',finished_at=bkk_now().isoformat(timespec='seconds'),message=f'{type(e).__name__}: {e}')
  finally:
   try:query_run_lock.release()
   except RuntimeError:pass
@@ -618,9 +636,31 @@ def start():
  elif mode=='LAST_NIGHT':query_shift='N';wd=today-timedelta(days=1)
  elif mode=='TONIGHT':query_shift='N';wd=today
  else:return jsonify(ok=False,error='Historical/custom-date query is disabled. Use TODAY DAY, LAST NIGHT, or TONIGHT.'),400
- j=uuid.uuid4().hex[:10];missing_only=bool(x.get('missing_only',False))
- with lock:jobs[j]={'status':'queued','total':0,'done':0,'current':'','message':f'Preparing {dept} missing employees...' if missing_only else f'Preparing {dept}...','department':dept,'query_shift':query_shift,'work_date':wd.isoformat(),'missing_only':missing_only}
- threading.Thread(target=runquery,args=(j,query_shift,wd.isoformat(),missing_only,dept),daemon=True).start();return jsonify(ok=True,job_id=j,department=dept)
+ missing_only=bool(x.get('missing_only',False));source=clean(x.get('source')).upper()
+ if source not in ('AUTO','MANUAL'):source='MANUAL'
+ dup_id,dup=find_duplicate_job(dept,mode,wd.isoformat(),missing_only)
+ if dup_id:
+  return jsonify(ok=True,job_id=dup_id,department=dept,duplicate=True,status=dup.get('status'),source=dup.get('source','MANUAL'))
+ j=uuid.uuid4().hex[:10]
+ with lock:
+  jobs[j]={'status':'queued','total':0,'done':0,'current':'','message':f'Preparing {dept} missing employees...' if missing_only else f'Preparing {dept}...','department':dept,'query_shift':query_shift,'mode':mode,'work_date':wd.isoformat(),'missing_only':missing_only,'source':source,'created_at':bkk_now().isoformat(timespec='seconds')}
+ threading.Thread(target=runquery,args=(j,query_shift,wd.isoformat(),missing_only,dept),daemon=True).start()
+ return jsonify(ok=True,job_id=j,department=dept,duplicate=False,status='queued',source=source)
+
+@app.get('/api/query-status')
+def query_status():
+ dept=norm_dept(request.args.get('department',''))
+ with lock:
+  rows=[job_public(jid,j) for jid,j in jobs.items()]
+ if dept and dept!='ALL':rows=[x for x in rows if x.get('department')==dept]
+ def sortkey(x):return x.get('created_at') or x.get('started_at') or ''
+ active=[x for x in rows if x.get('status') in ('queued','running')]
+ active.sort(key=sortkey)
+ recent=[x for x in rows if x.get('status') in ('done','error')]
+ recent.sort(key=lambda x:x.get('finished_at') or sortkey(x),reverse=True)
+ for i,x in enumerate(active,1):x['queue_position']=i
+ running=next((x for x in active if x.get('status')=='running'),None)
+ return jsonify(ok=True,server_time=bkk_now().isoformat(timespec='seconds'),query_busy=query_run_lock.locked(),running=running,active=active,queued=[x for x in active if x.get('status')=='queued'],recent=recent[:8])
 
 @app.get('/api/job/<j>')
 def job(j):
