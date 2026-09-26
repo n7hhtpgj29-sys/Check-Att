@@ -17,7 +17,7 @@ BASE=Path(__file__).resolve().parent
 DATA=BASE/'data'; DATA.mkdir(exist_ok=True)
 DB=DATA/'attendance.db'
 TARGET='https://webapp.calcomp.co.th/att/'
-VERSION='12.0-live-query-status'
+VERSION='12.1-always-visible-query-status'
 BKK=ZoneInfo('Asia/Bangkok')
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 AUTO_QUERY_TOKEN=os.getenv('AUTO_QUERY_TOKEN','').strip()

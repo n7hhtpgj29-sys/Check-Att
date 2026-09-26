@@ -1,0 +1,11 @@
+CC Attendance V12.1 — Always Visible Query Status
+
+- แถบ Query Status แสดงตลอดเวลา
+- IDLE: แสดง 🟢 IDLE • No query running
+- RUNNING: แสดง AUTO/MANUAL, Department, Mode, done/total และ current employee
+- QUEUED: แสดงลำดับงานที่รอ
+- COMPLETED/FAILED: แสดงผล Query ล่าสุดและเวลาจบ
+- ปุ่ม Query ของ Department ที่กำลังทำงานถูก disable
+- Query ซ้ำ Department + Mode + Work Date + Missing flag เดียวกัน จะติดตาม job เดิม ไม่สร้างซ้ำ
+- Health version: 12.1-always-visible-query-status
+- Workflow: Attendance Auto Query V12.1
