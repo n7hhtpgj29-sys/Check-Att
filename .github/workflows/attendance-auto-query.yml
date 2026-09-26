@@ -1,0 +1,161 @@
+name: Attendance Auto Query V11
+
+on:
+  schedule:
+    # Schedule is maintained in the web app per Department.
+    # GitHub only wakes the server every 5 minutes and asks which tasks are due.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: attendance-auto-query-v11
+  cancel-in-progress: false
+
+jobs:
+  run-due-schedules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      BASE_URL: ${{ vars.ATTENDANCE_BASE_URL || 'https://cc-attendance-iphone-pwa.onrender.com' }}
+      AUTO_TOKEN: ${{ secrets.ATTENDANCE_AUTO_TOKEN }}
+    steps:
+      - name: Wake Render and run Department schedules that are due
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, time
+          from urllib import request
+
+          base = os.environ['BASE_URL'].rstrip('/')
+          token = os.environ.get('AUTO_TOKEN','').strip()
+          ua = 'CC-Attendance-GitHub-AutoQuery/11.0'
+          if not token:
+              raise SystemExit('Missing repository secret ATTENDANCE_AUTO_TOKEN')
+
+          def call(path, payload=None, timeout=60, auth=False):
+              data = None
+              headers = {'User-Agent': ua, 'Accept': 'application/json'}
+              if auth:
+                  headers['X-Auto-Query-Token'] = token
+              if payload is not None:
+                  data = json.dumps(payload).encode('utf-8')
+                  headers['Content-Type'] = 'application/json'
+              req = request.Request(
+                  base + path,
+                  data=data,
+                  headers=headers,
+                  method='POST' if payload is not None else 'GET'
+              )
+              with request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read().decode('utf-8'))
+
+          print(f'Waking {base} ...')
+          health = None
+          for attempt in range(1, 31):
+              try:
+                  health = call('/api/health', timeout=45)
+                  if health.get('ok'):
+                      print(
+                          'Render ready:',
+                          health.get('version'),
+                          'schedule_store=',
+                          health.get('schedule_store')
+                      )
+                      break
+              except Exception as exc:
+                  print(f'Wake attempt {attempt}/30: {type(exc).__name__}: {exc}')
+              time.sleep(10)
+
+          if not health or not health.get('ok'):
+              raise SystemExit('Render service did not become ready')
+
+          tick = call('/api/auto-query/tick', {}, timeout=60, auth=True)
+          if not tick.get('ok'):
+              raise SystemExit(tick.get('error') or 'Auto tick failed')
+
+          tasks = tick.get('tasks', [])
+          print('Server time:', tick.get('now'))
+          print('Due tasks:', len(tasks))
+
+          if not tasks:
+              raise SystemExit(0)
+
+          failures = []
+
+          for task in tasks:
+              dept = task['department']
+              mode = task['mode']
+              slot = task['slot_key']
+              slot_date = task['slot_date']
+              print(f'\n=== {dept} / {slot} / {mode} ===')
+
+              job_id = ''
+              final_status = 'error'
+              final_message = ''
+
+              try:
+                  start = call(
+                      '/api/query',
+                      {'mode': mode, 'department': dept},
+                      timeout=60
+                  )
+                  if not start.get('ok') or not start.get('job_id'):
+                      raise RuntimeError(start.get('error') or 'Unable to start query')
+
+                  job_id = start['job_id']
+                  deadline = time.time() + 45 * 60
+
+                  while time.time() < deadline:
+                      last = call('/api/job/' + job_id, timeout=60)
+                      status = last.get('status')
+
+                      print(
+                          f"{dept}: {status} "
+                          f"{last.get('done',0)}/{last.get('total',0)} "
+                          f"{last.get('current','')} "
+                          f"{last.get('message','')}"
+                      )
+
+                      if status == 'done':
+                          final_status = 'done'
+                          final_message = last.get('message','')
+                          break
+
+                      if status == 'error':
+                          raise RuntimeError(last.get('message') or 'Query job failed')
+
+                      time.sleep(5)
+                  else:
+                      raise TimeoutError(f'{dept} query exceeded 45 minutes')
+
+              except Exception as exc:
+                  final_message = f'{type(exc).__name__}: {exc}'
+                  failures.append(f'{dept}/{slot}: {final_message}')
+                  print('ERROR:', final_message)
+
+              finally:
+                  try:
+                      call(
+                          '/api/auto-query/complete',
+                          {
+                              'department': dept,
+                              'slot_key': slot,
+                              'slot_date': slot_date,
+                              'status': final_status,
+                              'job_id': job_id,
+                              'message': final_message,
+                          },
+                          timeout=60,
+                          auth=True
+                      )
+                  except Exception as exc:
+                      print('Unable to report completion:', exc)
+
+          if failures:
+              print('\nFailures:')
+              for x in failures:
+                  print(' -', x)
+              raise SystemExit(1)
+
+          print('\nAll due Auto Query tasks completed.')
+          PY
