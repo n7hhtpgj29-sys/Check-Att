@@ -14,10 +14,10 @@ except Exception:
  dict_row=None
 
 BASE=Path(__file__).resolve().parent
-DATA=BASE/'data'; DATA.mkdir(exist_ok=True)
+DATA=Path(os.getenv('DATA_DIR',str(BASE/'data'))); DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/'attendance.db'
 TARGET='https://webapp.calcomp.co.th/att/'
-VERSION='12.1-always-visible-query-status'
+VERSION='12.1.1-persistent-master'
 BKK=ZoneInfo('Asia/Bangkok')
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 AUTO_QUERY_TOKEN=os.getenv('AUTO_QUERY_TOKEN','').strip()
@@ -28,8 +28,32 @@ jobs={}; lock=threading.Lock(); query_run_lock=threading.Lock()
 STARTED_AT=datetime.now().isoformat(timespec='seconds')
 
 def log(msg): print(f'[ATT] {datetime.now().isoformat(timespec="seconds")} {msg}', flush=True)
-def db():
- c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+from persistent_store import Store, DatabaseUnavailable
+store=Store(DATABASE_URL, DB)
+def db(): return store.tx()
+
+class DepartmentConflict(ValueError): pass
+
+def guard_department(c,emp,dept):
+ # Serializes competing employee writes across connections/processes.
+ c.write_lock()
+ row=c.execute('SELECT department FROM employees WHERE employee_code=?',(emp,)).fetchone()
+ if row and norm_dept(row['department'])!=dept:
+  raise DepartmentConflict(f'{emp} already belongs to {row["department"]}. No data was moved or overwritten.')
+
+@app.errorhandler(DatabaseUnavailable)
+def database_unavailable(exc):
+ return jsonify(ok=False,error='Database unavailable. Check DATABASE_URL and database status. No local fallback was used.'),503
+
+@app.errorhandler(DepartmentConflict)
+def department_conflict(exc):
+ return jsonify(ok=False,error=str(exc)),409
+
+@app.after_request
+def protect_api_cache(response):
+ if request.path.startswith('/api/'):
+  response.headers['Cache-Control']='no-store, private'
+ return response
 
 def clean(v): return '' if v is None else str(int(v) if isinstance(v,float) and v.is_integer() else v).strip()
 def norm_dept(v): return re.sub(r'[^A-Z0-9_-]+','-',clean(v).upper()).strip('-_')[:24]
@@ -75,11 +99,9 @@ AUTO_SLOTS=(
 )
 
 def bkk_now(): return datetime.now(BKK)
-def schedule_store_kind(): return 'postgres' if DATABASE_URL and psycopg else 'sqlite'
+def schedule_store_kind(): return 'postgres' if store.postgres else 'sqlite'
 
-def _pg_conn():
- if not (DATABASE_URL and psycopg): return None
- return psycopg.connect(DATABASE_URL,row_factory=dict_row,connect_timeout=10)
+def _pg_conn(): return store.pg_tx()
 
 def init_auto_store():
  if schedule_store_kind()=='postgres':
@@ -247,7 +269,8 @@ def auto_token_ok(req):
 
 init_auto_store()
 with db() as _c:
- for _r in _c.execute("SELECT code FROM departments WHERE active=1"):ensure_auto_schedule(_r[0])
+ _dept_codes=[_r[0] for _r in _c.execute("SELECT code FROM departments WHERE active=1")]
+for _code in _dept_codes:ensure_auto_schedule(_code)
 
 def ensure_department(code,name=None):
  d=norm_dept(code)
@@ -419,7 +442,9 @@ def manifest(): return send_from_directory(BASE/'static','manifest.webmanifest',
 @app.get('/sw.js')
 def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application/javascript')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked(),schedule_store=schedule_store_kind(),persistent_schedule=(schedule_store_kind()=='postgres'),auto_query_token_configured=bool(AUTO_QUERY_TOKEN))
+def health():
+ store.ping()
+ return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked(),schedule_store=schedule_store_kind(),data_store=store.kind,persistent_data=store.postgres,persistent_master=store.postgres,persistent_departments=store.postgres,persistent_schedule=store.postgres,auto_query_token_configured=bool(AUTO_QUERY_TOKEN))
 @app.get('/')
 def home(): return render_template('index.html')
 
@@ -492,14 +517,20 @@ def upload():
   incoming={}
   for r in ws.iter_rows(min_row=2,values_only=True):
    emp=re.sub(r'<[^>]+>','',clean(r[idx['employee_code']])).strip().upper()
-   if emp:incoming[emp]=(clean(r[idx['full_name']]),clean(r[idx['location_support']]),clean(r[idx['team_support']]),clean(r[idx['group_code']]).upper(),clean(r[idx['shift']]).upper())
-  wb.close();now=datetime.now().isoformat(timespec='seconds')
+   if emp:
+    if emp in incoming:raise ValueError('Duplicate employee code in Excel: '+emp)
+    if clean(r[idx['shift']]).upper() not in ('D','N'):raise ValueError('Shift must be D or N: '+emp)
+    incoming[emp]=(clean(r[idx['full_name']]),clean(r[idx['location_support']]),clean(r[idx['team_support']]),clean(r[idx['group_code']]).upper(),clean(r[idx['shift']]).upper())
+  wb.close()
+  if not incoming:raise ValueError('No employee rows found. Existing employees were not changed.')
+  now=datetime.now().isoformat(timespec='seconds')
   with db() as c:
    current={x[0] for x in c.execute('SELECT employee_code FROM employees WHERE active=1 AND department=?',(dept,))}
+   for emp in incoming:guard_department(c,emp,dept)
    sql="INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=1,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift"
    for emp,(name,loc,team,grp,sh) in incoming.items():c.execute(sql,(emp,name,dept,'',1,now,loc,team,grp,sh))
-   for x in current-set(incoming):c.execute('UPDATE employees SET active=0,updated_at=? WHERE employee_code=? AND department=?',(now,x,dept))
-  return jsonify(ok=True,department=dept,total=len(incoming),added=len(set(incoming)-current),removed=len(current-set(incoming)))
+   # Merge upload: omitted employees stay active. Deactivate explicitly from Employee Master.
+  return jsonify(ok=True,department=dept,total=len(incoming),added=len(set(incoming)-current),removed=0)
  except Exception as e:return jsonify(ok=False,error=str(e)),400
  finally:
   try:path.unlink(missing_ok=True)
@@ -520,26 +551,11 @@ def state_export():
 
 @app.post('/api/state/restore')
 def state_restore():
- x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'));rows=x.get('employees');att=x.get('attendance') or []
- if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
- if not isinstance(rows,list) or not rows:return jsonify(ok=False,error='employees must be a non-empty array'),400
- ensure_department(dept);now=datetime.now().isoformat(timespec='seconds');incoming={}
- for r in rows:
-  if not isinstance(r,dict):continue
-  emp=re.sub(r'<[^>]+>','',clean(r.get('employee_code'))).strip().upper()
-  if emp:incoming[emp]=(clean(r.get('full_name')),clean(r.get('location_support')),clean(r.get('team_support')),clean(r.get('group_code')).upper(),clean(r.get('shift')).upper(),1 if r.get('active',True) else 0)
- if not incoming:return jsonify(ok=False,error='No valid employee records'),400
- with db() as c:
-  old=[z[0] for z in c.execute('SELECT employee_code FROM employees WHERE department=?',(dept,))]
-  for emp in old:c.execute('DELETE FROM attendance WHERE employee_code=?',(emp,))
-  c.execute('DELETE FROM employees WHERE department=?',(dept,))
-  for emp,(name,loc,team,grp,sh,active) in incoming.items():c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?)',(emp,name,dept,'',active,now,loc,team,grp,sh))
-  for r in att:
-   if not isinstance(r,dict):continue
-   emp=clean(r.get('employee_code')).upper()
-   if emp not in incoming:continue
-   c.execute('INSERT INTO attendance(employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(emp,clean(r.get('name_from_web')),clean(r.get('latest_datetime')),clean(r.get('status')),clean(r.get('query_at')),clean(r.get('scan_in')),clean(r.get('scan_out')),int(r.get('raw_count') or 0),int(r.get('ot_minutes') or 0),clean(r.get('work_date'))))
- return jsonify(ok=True,department=dept,total=len(incoming),attendance=len(att))
+ x=request.get_json(silent=True) or {}
+ try:
+  result=recovery.import_pack(x)
+  return jsonify(ok=True,department=norm_dept(x.get('department')),total=result['employees_in_file'],active=result['employees_in_file'],attendance=result['attendance_added'],merge_only=True,**result)
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 @app.get('/api/master/export')
 def master_export():
@@ -550,21 +566,11 @@ def master_export():
 
 @app.post('/api/master/replace')
 def master_replace():
- x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'));rows=x.get('employees')
- if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
- if not isinstance(rows,list):return jsonify(ok=False,error='employees must be an array'),400
- ensure_department(dept);incoming={}
- for r in rows:
-  if not isinstance(r,dict):continue
-  emp=re.sub(r'<[^>]+>','',clean(r.get('employee_code'))).strip().upper()
-  if emp:incoming[emp]={'employee_code':emp,'full_name':clean(r.get('full_name')),'location_support':clean(r.get('location_support')),'team_support':clean(r.get('team_support')),'group_code':clean(r.get('group_code')).upper(),'shift':clean(r.get('shift')).upper(),'active':1 if r.get('active',True) else 0}
- if not incoming:return jsonify(ok=False,error='No valid employee records'),400
- now=datetime.now().isoformat(timespec='seconds')
- with db() as c:
-  c.execute('UPDATE employees SET active=0,updated_at=? WHERE department=?',(now,dept))
-  sql="INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift"
-  for r in incoming.values():c.execute(sql,(r['employee_code'],r['full_name'],dept,'',r['active'],now,r['location_support'],r['team_support'],r['group_code'],r['shift']))
- return jsonify(ok=True,department=dept,total=len(incoming),active=sum(r['active'] for r in incoming.values()))
+ x=request.get_json(silent=True) or {}
+ try:
+  result=recovery.import_pack(x)
+  return jsonify(ok=True,department=norm_dept(x.get('department')),total=result['employees_in_file'],active=result['employees_in_file'],attendance=result['attendance_added'],merge_only=True,**result)
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 @app.get('/api/employees')
 def employee_list():
@@ -580,7 +586,9 @@ def employee_save():
  if not emp:return jsonify(ok=False,error='Employee No. required'),400
  if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
  ensure_department(dept);now=datetime.now().isoformat(timespec='seconds')
- with db() as c:c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift',(emp,clean(x.get('full_name')),dept,'',1 if x.get('active',True) else 0,now,clean(x.get('location_support')),clean(x.get('team_support')),clean(x.get('group_code')).upper(),clean(x.get('shift')).upper()))
+ with db() as c:
+  guard_department(c,emp,dept)
+  c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift',(emp,clean(x.get('full_name')),dept,'',1 if x.get('active',True) else 0,now,clean(x.get('location_support')),clean(x.get('team_support')),clean(x.get('group_code')).upper(),clean(x.get('shift')).upper()))
  return jsonify(ok=True,department=dept)
 
 @app.get('/api/auto-schedule')
@@ -606,7 +614,7 @@ def auto_query_tick():
  if not auto_token_ok(request):return jsonify(ok=False,error='Auto Query token missing or invalid'),401
  now=bkk_now();tasks=[]
  try:
-  with db() as c:deps=[norm_dept(x[0]) for x in c.execute("SELECT code FROM departments WHERE active=1 ORDER BY code")]
+  with db() as c:deps=[norm_dept(x[0]) for x in c.execute("SELECT d.code FROM departments d WHERE d.active=1 AND EXISTS(SELECT 1 FROM employees e WHERE e.department=d.code AND e.active=1) ORDER BY d.code")]
   for dept in deps:
    sched=get_auto_schedule(dept)
    if not sched or not sched.get('enabled') or now.weekday() not in set(sched.get('weekdays') or []):continue
@@ -666,5 +674,22 @@ def query_status():
 def job(j):
  with lock:x=jobs.get(j)
  return jsonify(ok=bool(x),**(x or {'error':'Job not found'}))
+
+from data_recovery import Recovery
+recovery=Recovery(store,ensure_auto_schedule)
+
+@app.get('/api/data/export-all')
+def export_all():
+ return jsonify(recovery.export_all())
+
+@app.post('/api/data/import-preview')
+def import_preview():
+ try:return jsonify(ok=True,**recovery.preview(request.get_json(silent=True) or {}))
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
+
+@app.post('/api/data/import')
+def import_all():
+ try:return jsonify(ok=True,**recovery.import_pack(request.get_json(silent=True) or {}))
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')),debug=False,threaded=True)
