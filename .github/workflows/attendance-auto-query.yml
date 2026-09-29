@@ -1,4 +1,4 @@
-name: Attendance Auto Query V12.1
+name: Attendance Auto Query V12.1.3
 
 on:
   schedule:
@@ -22,13 +22,13 @@ jobs:
       - name: Wake Render and run Department schedules that are due
         shell: bash
         run: |
-          python - <<'PY'
+          python -u - <<'PY'
           import json, os, time
           from urllib import request
 
           base = os.environ['BASE_URL'].rstrip('/')
           token = os.environ.get('AUTO_TOKEN','').strip()
-          ua = 'CC-Attendance-GitHub-AutoQuery/12.1'
+          ua = 'CC-Attendance-GitHub-AutoQuery/12.1.3'
           if not token:
               raise SystemExit('Missing repository secret ATTENDANCE_AUTO_TOKEN')
 
@@ -59,7 +59,8 @@ jobs:
           if not health or not health.get('ok'):
               raise SystemExit('Render service did not become ready')
 
-          tick = call('/api/auto-query/tick', {}, timeout=60, auth=True)
+          trigger = os.getenv('GITHUB_EVENT_NAME', 'unknown')
+          tick = call('/api/auto-query/tick', {'trigger': trigger}, timeout=60, auth=True)
           if not tick.get('ok'):
               raise SystemExit(tick.get('error') or 'Auto tick failed')
           tasks = tick.get('tasks', [])
@@ -79,7 +80,7 @@ jobs:
               final_status = 'error'
               final_message = ''
               try:
-                  start = call('/api/query', {'mode': mode, 'department': dept, 'source': 'AUTO'}, timeout=60)
+                  start = call('/api/query', {'mode': mode, 'department': dept, 'source': 'AUTO', 'trigger': trigger, 'slot_key': slot, 'slot_date': slot_date, 'work_date': task['work_date']}, timeout=60, auth=True)
                   if not start.get('ok') or not start.get('job_id'):
                       raise RuntimeError(start.get('error') or 'Unable to start query')
                   job_id = start['job_id']
