@@ -175,7 +175,7 @@ def test_export_import_roundtrip_to_new_database(app,tmp_path):
 
 def test_database_health_reports_local_honestly(app):
     d,status=app.app.invoke('GET','/api/health')
-    assert d['version']=='12.1.1-persistent-master' and not d['persistent_data'] and d['data_store']=='sqlite-local'
+    assert d['version']=='12.1.3-thai-time-four-views' and not d['persistent_data'] and d['data_store']=='sqlite-local'
 
 def test_backup_invalid_duplicate_codes_rejected(app):
     with pytest.raises(ValueError):app.recovery.import_pack(dict(department='PEM',employees=[emp(),emp()]))
@@ -188,7 +188,7 @@ def test_transaction_rollback_preserves_existing(app):
             raise RuntimeError('test failure')
     with app.db() as c:assert c.execute('SELECT full_name FROM employees').fetchone()[0]=='Maintained name'
 
-def test_github_workflow_byte_identical():
+def test_github_workflow_matches_release_checksum():
     p='.github/workflows/attendance-auto-query.yml'
     assert hashlib.sha256((ROOT/p).read_bytes()).hexdigest()==(ROOT/'tests/expected_workflow.sha256').read_text().strip()
 
@@ -198,10 +198,10 @@ def test_old_browser_automatic_restore_removed():
     assert 'restoreState(true)' not in body and 'restoreMaster(true)' not in body
     assert 'ccAttendanceStateV1211' in s
 
-def test_default_excel_upload_does_not_deactivate():
+def test_legacy_upload_requires_preview_in_v1212():
     s=(ROOT/'app.py').read_text();s=s[s.index('def upload():'):s.index('# Department-scoped')]
     assert "UPDATE employees SET active=0" not in s
-    assert "if not incoming:raise ValueError" in s
+    assert "PREVIEW_REQUIRED" in s and ",409" in s
 
 def test_empty_department_does_not_consume_auto_slot_during_migration(app):
     # Force a due clock matching DAY #1 but there are no employees yet.

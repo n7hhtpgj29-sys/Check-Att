@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from shift_backup import export_archive,import_archive,validate_archive
 
 BKK = ZoneInfo('Asia/Bangkok')
 EMP_COLS = ('employee_code','full_name','department','position','active','updated_at',
@@ -32,6 +33,7 @@ def normalize(pack):
     deps = pack.get('departments', [])
     if not isinstance(raw,list) or not isinstance(deps,list): raise ValueError('Invalid backup arrays.')
     if len(raw)>100000: raise ValueError('Too many employees in backup.')
+    validate_archive(pack)
     default_dept = pack.get('department')
     dmap = {}
     for r in deps:
@@ -101,12 +103,13 @@ class Recovery:
                 c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
             tables={name:[dict(x) for x in c.execute('SELECT * FROM '+name)]
                     for name in ('departments','employees','attendance','auto_schedules')}
+            tables.update(export_archive(c))
         # psycopg timestamps in schedules must be JSON portable.
         for rows in tables.values():
             for r in rows:
                 for k,v in list(r.items()):
                     if hasattr(v,'isoformat'):r[k]=v.isoformat()
-        return dict(ok=True,format='cc-attendance-all-v1211',version='12.1.1',exported_at=now(),**tables)
+        return dict(ok=True,format='cc-attendance-all-v1211',version='12.1.3',exported_at=now(),**tables)
     def _summary(self,c,normalized):
         deps={r['code'] for r in c.execute('SELECT code FROM departments')}
         existing={r['employee_code']:r['department'] for r in c.execute('SELECT employee_code,department FROM employees')}
@@ -151,5 +154,6 @@ class Recovery:
                 cur=c.execute('INSERT INTO auto_schedules('+','.join(SCHEDULE_COLS)+') VALUES('+','.join('?' for _ in SCHEDULE_COLS)+') '
                               'ON CONFLICT(department) DO NOTHING',tuple(r[k] for k in SCHEDULE_COLS))
                 result['schedules_added']+=max(0,cur.rowcount)
+            result['archive_rows_added']=import_archive(c,pack)
         for r in n['departments']:self.ensure_schedule(r['code'])
         return result

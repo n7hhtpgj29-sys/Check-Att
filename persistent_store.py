@@ -53,14 +53,21 @@ def pg_sql(query: str, has_parameters: bool = True) -> str:
     return result
 
 class Tx:
-    def __init__(self, conn, postgres: bool):
+    def __init__(self, conn, postgres: bool, roster_hook=None):
         self.conn, self.postgres = conn, postgres
         self._locked = False
+        self.roster_hook=roster_hook
+        self.roster_dirty=False
     def write_lock(self):
         if self.postgres and not self._locked:
             self.conn.execute('SELECT pg_advisory_xact_lock(%s)', (WRITE_LOCK,))
         self._locked = True
     def execute(self, query, params=()):
+        if self.roster_hook and re.match(r'\s*(?:INSERT(?:\s+OR\s+IGNORE)?\s+INTO|UPDATE|DELETE\s+FROM)\s+employees\b',query,re.I):
+            self.write_lock()
+            if not self.roster_dirty:
+                self.roster_hook(self)
+                self.roster_dirty=True
         if self.postgres:
             m = re.fullmatch(r'\s*PRAGMA table_info\((\w+)\)\s*;?\s*', query, re.I)
             if m:
@@ -130,9 +137,10 @@ class Store:
     def tx(self, serial=False):
         if self.postgres:
             with self.pg_tx() as c:
-                t = Tx(c, True)
+                t = Tx(c, True, getattr(self,"roster_hook",None))
                 if serial: t.write_lock()
                 yield t
+                if t.roster_dirty:t.roster_hook(t)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(self.path, timeout=15)
@@ -141,7 +149,9 @@ class Store:
             c.execute('PRAGMA busy_timeout=15000')
             # Local/test mode: serialize writes, including read-modify-write imports.
             c.execute('BEGIN IMMEDIATE')
-            yield Tx(c, False)
+            t=Tx(c, False, getattr(self,"roster_hook",None))
+            yield t
+            if t.roster_dirty:t.roster_hook(t)
             c.commit()
         except Exception:
             c.rollback(); raise

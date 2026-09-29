@@ -3,6 +3,9 @@ import os,re,sqlite3,threading,time,uuid,json
 from zoneinfo import ZoneInfo
 from datetime import datetime,date,time as dtime,timedelta
 from pathlib import Path
+from shift_history import ShiftHistory, bkk_now, resolve_view, normalize_mode, fingerprint, MODES
+from thai_schedule import ThaiSchedules
+import hmac
 from flask import Flask,jsonify,render_template,request,send_from_directory
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
@@ -17,17 +20,17 @@ BASE=Path(__file__).resolve().parent
 DATA=Path(os.getenv('DATA_DIR',str(BASE/'data'))); DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/'attendance.db'
 TARGET='https://webapp.calcomp.co.th/att/'
-VERSION='12.1.1-persistent-master'
+VERSION='12.1.3-thai-time-four-views'
 BKK=ZoneInfo('Asia/Bangkok')
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 AUTO_QUERY_TOKEN=os.getenv('AUTO_QUERY_TOKEN','').strip()
 AUTO_GRACE_MINUTES=int(os.getenv('AUTO_GRACE_MINUTES','180'))
 app=Flask(__name__)
 app.config['MAX_CONTENT_LENGTH']=20*1024*1024
-jobs={}; lock=threading.Lock(); query_run_lock=threading.Lock()
-STARTED_AT=datetime.now().isoformat(timespec='seconds')
+jobs={}; lock=threading.RLock(); query_run_lock=threading.Lock()
+STARTED_AT=bkk_now().isoformat(timespec='seconds')
 
-def log(msg): print(f'[ATT] {datetime.now().isoformat(timespec="seconds")} {msg}', flush=True)
+def log(msg): print(f'[ATT] {bkk_now().isoformat(timespec="seconds")} {msg}', flush=True)
 from persistent_store import Store, DatabaseUnavailable
 store=Store(DATABASE_URL, DB)
 def db(): return store.tx()
@@ -71,7 +74,7 @@ def init():
    if n not in ac:c.execute(f"ALTER TABLE attendance ADD COLUMN {n} TEXT DEFAULT ''")
   if 'raw_count' not in ac:c.execute('ALTER TABLE attendance ADD COLUMN raw_count INTEGER DEFAULT 0')
   if 'ot_minutes' not in ac:c.execute('ALTER TABLE attendance ADD COLUMN ot_minutes INTEGER DEFAULT 0')
-  now=datetime.now().isoformat(timespec='seconds')
+  now=bkk_now().isoformat(timespec='seconds')
   # v8 and earlier had a department column but did not use it. Preserve the existing PE master.
   c.execute("UPDATE employees SET department='PE' WHERE TRIM(COALESCE(department,''))='' ")
   c.execute("INSERT OR IGNORE INTO departments(code,name,active,updated_at) VALUES('PE','PE',1,?)",(now,))
@@ -265,18 +268,32 @@ def complete_auto_run(dept,slot_key,slot_date,status,job_id='',message=''):
 
 def auto_token_ok(req):
  if not AUTO_QUERY_TOKEN:return False
- return req.headers.get('X-Auto-Query-Token','')==AUTO_QUERY_TOKEN
+ return hmac.compare_digest(req.headers.get('X-Auto-Query-Token',''),AUTO_QUERY_TOKEN)
 
 init_auto_store()
 with db() as _c:
  _dept_codes=[_r[0] for _r in _c.execute("SELECT code FROM departments WHERE active=1")]
 for _code in _dept_codes:ensure_auto_schedule(_code)
 
+history=ShiftHistory(store,clock=lambda:bkk_now())
+history.init()
+schedules=ThaiSchedules(store,clock=lambda:bkk_now(),grace=AUTO_GRACE_MINUTES)
+schedules.init()
+schedules.roster=history.roster
+jobs.update(history.previous_jobs())
+for _jid,_job in jobs.items():
+ if _job.get('status') in ('running','queued'):
+  _job.update(status='error',finished_at=bkk_now().isoformat(timespec='seconds'),message='Server restarted. This job did not complete; retry is required.')
+  history.save_job(_jid,_job)
+  schedules.job_state(_jid,_job)
+
+
 def ensure_department(code,name=None):
  d=norm_dept(code)
  if not d:return ''
- now=datetime.now().isoformat(timespec='seconds')
+ now=bkk_now().isoformat(timespec='seconds')
  with db() as c:
+  c.write_lock()
   c.execute('INSERT INTO departments(code,name,active,updated_at) VALUES(?,?,1,?) ON CONFLICT(code) DO UPDATE SET name=COALESCE(NULLIF(excluded.name,\'\'),departments.name),active=1,updated_at=excluded.updated_at',(d,clean(name) or d,now))
  try: ensure_auto_schedule(d)
  except Exception as e: log(f'AUTO SCHEDULE INIT ERROR dept={d} {type(e).__name__}: {e}')
@@ -302,7 +319,7 @@ def workday_for_shift(shift, now=None, requested_work_date=None):
  if requested_work_date:
   try:return datetime.strptime(requested_work_date,'%Y-%m-%d').date()
   except:pass
- now=now or datetime.now()
+ now=now or bkk_now()
  if clean(shift).upper()=='N' and now.time()<dtime(18,0): return now.date()-timedelta(days=1)
  return now.date()
 
@@ -316,7 +333,7 @@ def choose(rs,emp,group='',shift='D',requested_work_date=None):
  for r in rs:
   if len(r)<4 or clean(r[1]).upper()!=emp.upper():continue
   d=parse_dt(r[3]); name=name or clean(r[2])
-  if d and d.year>=2020 and d.date()<=date.today()+timedelta(days=1):valid.append(d)
+  if d and d.year>=2020 and d.date()<=bkk_now().date()+timedelta(days=1):valid.append(d)
  if not valid:return None,'QUERY UNAVAILABLE',name,[],[],0,''
  wd=workday_for_shift(shift,requested_work_date=requested_work_date); sh=clean(shift).upper(); g=clean(group).upper(); start_t,end_t=schedule(g,sh)
  if sh=='N':
@@ -337,7 +354,10 @@ def choose(rs,emp,group='',shift='D',requested_work_date=None):
   gross=max(0,int((scan_out-normal_end).total_seconds()//60)) if scan_out else 0
   net=max(0,gross-30); ot=net if net>=60 else 0
   return max(rec),'PRESENT',name,[scan_in],[scan_out] if scan_out else [],ot,wd.strftime('%d/%m/%Y')
- return max(valid),'NO SCAN TODAY',name,[],[],0,wd.strftime('%d/%m/%Y')
+ past = wd < bkk_now().date()
+ status = 'NO DATA FOR SHIFT' if past else 'NO SCAN TODAY'
+ if not past and bkk_now().time()<start_t:status='NOT STARTED'
+ return max(valid),status,name,[],[],0,wd.strftime('%d/%m/%Y')
 
 def query_once(page,emp,group='',shift='D',timeout=12,requested_work_date=None):
  page.goto(TARGET,wait_until='domcontentloaded',timeout=30000)
@@ -363,7 +383,11 @@ def query_once(page,emp,group='',shift='D',timeout=12,requested_work_date=None):
 
 def setjob(j,**kw):
  with lock:
-  if j in jobs: jobs[j].update(kw)
+  if j not in jobs:return
+  jobs[j].update(kw);state=dict(jobs[j])
+ history.save_job(j,state)
+ schedules.job_state(j,state)
+
 
 def job_signature(department,mode,work_date,missing_only):
  return (norm_dept(department),clean(mode).upper(),clean(work_date),bool(missing_only))
@@ -388,17 +412,11 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False,dep
   setjob(j,status='queued',current='',message=f'{department} • Waiting for current department query to finish...')
  query_run_lock.acquire()
  try:
-  with db() as c:
-   sql='SELECT e.* FROM employees e LEFT JOIN attendance a ON a.employee_code=e.employee_code WHERE e.active=1 AND e.department=?'; args=[department]
-   if query_shift in ('D','N'): sql+=' AND e.shift=?'; args.append(query_shift)
-   if missing_only:
-    target_wd=''
-    if requested_work_date:
-     try:target_wd=datetime.strptime(requested_work_date,'%Y-%m-%d').strftime('%d/%m/%Y')
-     except:target_wd=''
-    sql+=" AND (a.employee_code IS NULL OR a.status IS NULL OR a.status!='PRESENT' OR COALESCE(a.work_date,'')!=?)";args.append(target_wd)
-   sql+=' ORDER BY e.shift,e.location_support,e.team_support,e.employee_code'
-   emps=[dict(x) for x in c.execute(sql,args)]
+  history.capture_today()
+  wd=requested_work_date
+  rows=history.records(department,wd,query_shift)
+  if rows is None:raise ValueError('No saved roster for this date/shift. Historical attendance cannot be inferred from the latest Excel.')
+  emps=[r for r in rows if not missing_only or r.get('status')!='PRESENT']
   setjob(j,status='running',total=len(emps),done=0,started_at=bkk_now().isoformat(timespec='seconds'),message=f'Checking {department} attendance...');results={};failed=[]
   if not emps:
    setjob(j,status='done',total=0,done=0,current='',finished_at=bkk_now().isoformat(timespec='seconds'),message=f'No active employees in {department} for this shift');return
@@ -424,13 +442,23 @@ def runquery(j,query_shift='ALL',requested_work_date=None,missing_only=False,dep
       page.wait_for_timeout(1500);ee=next((x for x in emps if x['employee_code']==emp),{});results[emp]=query_once(page,emp,ee.get('group_code',''),ee.get('shift','D'),15,requested_work_date)
      except Exception as ex:log(f'RETRY ERROR dept={department} emp={emp} {type(ex).__name__}: {ex}')
    ctx.close();browser.close()
-  now=datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+  now=bkk_now().strftime('%d/%m/%Y %H:%M:%S');skipped=0
   with db() as c:
+   c.write_lock()
+   original={e['employee_code']:e for e in emps}
+   current_roster={r['employee_code']:r for r in (history.roster(department,wd,query_shift,c) or [])}
    for emp,r in results.items():
-    c.execute('INSERT INTO attendance(employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET name_from_web=excluded.name_from_web,latest_datetime=excluded.latest_datetime,status=excluded.status,query_at=excluded.query_at,scan_in=excluded.scan_in,scan_out=excluded.scan_out,raw_count=excluded.raw_count,ot_minutes=excluded.ot_minutes,work_date=excluded.work_date',(emp,r['name_from_web'],r['latest_datetime'],r['status'],now,r.get('scan_in',''),r.get('scan_out',''),r.get('raw_count',0),r.get('ot_minutes',0),r.get('work_date','')))
+    prior=original[emp];current=current_roster.get(emp)
+    if not current or fingerprint(current)!=fingerprint(prior):
+     skipped+=1;continue
+    history.save_result(c,prior,wd,query_shift,r)
+    if wd==bkk_now().date().isoformat():
+     current=c.execute('SELECT * FROM employees WHERE employee_code=?',(emp,)).fetchone()
+     if current and fingerprint(dict(current))==fingerprint(prior):
+      c.execute('INSERT INTO attendance(employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET name_from_web=excluded.name_from_web,latest_datetime=excluded.latest_datetime,status=excluded.status,query_at=excluded.query_at,scan_in=excluded.scan_in,scan_out=excluded.scan_out,raw_count=excluded.raw_count,ot_minutes=excluded.ot_minutes,work_date=excluded.work_date',(emp,r['name_from_web'],r['latest_datetime'],r['status'],now,r.get('scan_in',''),r.get('scan_out',''),r.get('raw_count',0),r.get('ot_minutes',0),r.get('work_date','')))
   newly_present=sum(1 for r in results.values() if r.get('status')=='PRESENT')
   msg=f'{department} • Rechecked {len(emps)} employee(s) • {newly_present} present' if missing_only else f'{department} attendance updated'
-  setjob(j,status='done',current='',done=len(emps),total=len(emps),finished_at=bkk_now().isoformat(timespec='seconds'),message=msg)
+  setjob(j,status='done',current='',done=len(emps),total=len(emps),finished_at=bkk_now().isoformat(timespec='seconds'),message=msg+(' • master changed, skipped '+str(skipped) if skipped else ''),error_count=sum(r.get('status')=='QUERY UNAVAILABLE' for r in results.values()))
  except Exception as e:
   log(f'JOB ERROR dept={department} {type(e).__name__}: {e}');setjob(j,status='error',current='',finished_at=bkk_now().isoformat(timespec='seconds'),message=f'{type(e).__name__}: {e}')
  finally:
@@ -444,7 +472,7 @@ def sw(): return send_from_directory(BASE/'static','sw.js',mimetype='application
 @app.get('/api/health')
 def health():
  store.ping()
- return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz=os.getenv('TZ',''),started_at=STARTED_AT,query_busy=query_run_lock.locked(),schedule_store=schedule_store_kind(),data_store=store.kind,persistent_data=store.postgres,persistent_master=store.postgres,persistent_departments=store.postgres,persistent_schedule=store.postgres,auto_query_token_configured=bool(AUTO_QUERY_TOKEN))
+ return jsonify(ok=True,version=VERSION,target=TARGET,headless=os.getenv('PLAYWRIGHT_HEADLESS','0')!='0',tz='Asia/Bangkok',utc_offset='+07:00',server_time=bkk_now().isoformat(timespec='seconds'),system_tz=os.getenv('TZ',''),four_views=list(MODES),history_from='12.1.3 upgrade; older unknown rosters are not inferred',started_at=STARTED_AT,query_busy=query_run_lock.locked(),schedule_store=schedule_store_kind(),data_store=store.kind,persistent_data=store.postgres,persistent_master=store.postgres,persistent_departments=store.postgres,persistent_schedule=store.postgres,auto_query_token_configured=bool(AUTO_QUERY_TOKEN))
 @app.get('/')
 def home(): return render_template('index.html')
 
@@ -462,6 +490,7 @@ def department_save():
 
 @app.get('/api/dashboard')
 def dash():
+ if request.args.get('view'):return four_dashboard()
  dept=norm_dept(request.args.get('department','')) or 'PE';loc=request.args.get('location','ALL');team=request.args.get('team','ALL');sh=request.args.get('shift','ALL');grp=request.args.get('group','ALL')
  wh=['e.active=1'];args=[]
  if dept!='ALL':wh.append('e.department=?');args.append(dept)
@@ -493,48 +522,46 @@ def dash():
   return out
  day=[x for x in data if clean(x.get('shift')).upper()=='D'];night=[x for x in data if clean(x.get('shift')).upper()=='N']
  bydept=breakdown(data,'department')
- return jsonify(ok=True,department=dept,departments=deps,employees=data,counts=stat(data),locations=locs,teams=teams,shift_counts={'D':stat(day),'N':stat(night)},by_department=bydept,by_location={'ALL':breakdown(data,'location_support'),'D':breakdown(day,'location_support'),'N':breakdown(night,'location_support')},by_team={'ALL':breakdown(data,'team_support'),'D':breakdown(day,'team_support'),'N':breakdown(night,'team_support')},last_query=max([x.get('query_at') or '' for x in data],default=''),current_night_work_date=workday_for_shift('N').strftime('%d/%m/%Y'),current_day_work_date=date.today().strftime('%d/%m/%Y'))
+ return jsonify(ok=True,department=dept,departments=deps,employees=data,counts=stat(data),locations=locs,teams=teams,shift_counts={'D':stat(day),'N':stat(night)},by_department=bydept,by_location={'ALL':breakdown(data,'location_support'),'D':breakdown(day,'location_support'),'N':breakdown(night,'location_support')},by_team={'ALL':breakdown(data,'team_support'),'D':breakdown(day,'team_support'),'N':breakdown(night,'team_support')},last_query=max([x.get('query_at') or '' for x in data],default=''),current_night_work_date=workday_for_shift('N').strftime('%d/%m/%Y'),current_day_work_date=bkk_now().date().strftime('%d/%m/%Y'))
+
+def four_dashboard():
+ try:v=resolve_view(request.args.get('view','DAY'),bkk_now())
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
+ department=norm_dept(request.args.get('department','PE')) or 'PE'
+ history.capture_today();missing=[];allrows=[]
+ with db() as c:
+  deps=[dict(r) for r in c.execute("SELECT d.code,d.name,d.active,COUNT(CASE WHEN e.active=1 THEN 1 END) employee_count FROM departments d LEFT JOIN employees e ON e.department=d.code WHERE d.active=1 GROUP BY d.code,d.name,d.active ORDER BY d.code")]
+  for d in deps:
+   if department!='ALL' and d['code']!=department:continue
+   r=history.records(d['code'],v['work_date'],v['shift'],c)
+   if r is None:missing.append(d['code'])
+   else:allrows.extend(r)
+ rows=allrows
+ for key,arg in (('location_support','location'),('team_support','team'),('group_code','group')):
+  val=request.args.get(arg,'ALL')
+  if val!='ALL':rows=[r for r in rows if r.get(key)==val]
+ def stat(data):
+  out={k:0 for k in ('PRESENT','NO SCAN TODAY','QUERY UNAVAILABLE','NOT CHECKED','NO DATA FOR SHIFT','NOT STARTED')};out['TOTAL']=len(data)
+  for r in data:out[r.get('status') if r.get('status') in out else 'NOT CHECKED']+=1
+  return out
+ def breakdown(data,key):
+  out={}
+  for r in data:
+   k=clean(r.get(key)) or '(Not set)';x=out.setdefault(k,dict(total=0,present=0,no_scan=0,error=0,not_checked=0));x['total']+=1
+   st=r.get('status');x['present' if st=='PRESENT' else 'no_scan' if st=='NO SCAN TODAY' else 'error' if st=='QUERY UNAVAILABLE' else 'not_checked']+=1
+  return out
+ day=[r for r in rows if r['shift']=='D'];night=[r for r in rows if r['shift']=='N']
+ by=lambda key:{'ALL':breakdown(rows,key),'D':breakdown(day,key),'N':breakdown(night,key)}
+ return jsonify(ok=True,department=department,view=v,views=[resolve_view(m,bkk_now()) for m in MODES],server_time=bkk_now().isoformat(timespec='seconds'),
+  missing_rosters=missing,roster_known=not missing,departments=deps,employees=rows,counts=stat(rows),
+  locations=sorted({r.get('location_support','') for r in allrows if r.get('location_support')}),teams=sorted({r.get('team_support','') for r in allrows if r.get('team_support')}),
+  shift_counts={'D':stat(day),'N':stat(night)},by_department=breakdown(rows,'department'),by_location=by('location_support'),by_team=by('team_support'),
+  last_query=max((r.get('query_at','') for r in rows),default=''),current_day_work_date=v['date_label'],current_night_work_date=v['date_label'])
 
 @app.post('/api/upload-master')
 def upload():
- f=request.files.get('file');dept=norm_dept(request.form.get('department',''))
- if not dept or dept=='ALL':return jsonify(ok=False,error='Select one department before uploading Employee Master'),400
- if not f or not f.filename.lower().endswith('.xlsx'):return jsonify(ok=False,error='กรุณาเลือกไฟล์ .xlsx'),400
- ensure_department(dept)
- path=DATA/f'master_{uuid.uuid4().hex[:8]}.xlsx';f.save(path)
- try:
-  wb=load_workbook(path,read_only=True,data_only=True);ws=wb[wb.sheetnames[0]]
-  def hnorm(v):
-   z=clean(v).lower().replace('\n',' ').replace('\r',' ');return re.sub(r'[^a-z0-9ก-๙]+','_',z).strip('_')
-  hs=[hnorm(c.value) for c in ws[1]]
-  aliases={'employee_code':['employee_code','employee_no','emp_no','empno','รหัสพนักงาน'],'full_name':['full_name','name','employee_name','ชื่อ','ชื่อพนักงาน'],'location_support':['location_support','location','support_location'],'team_support':['team_support','team','support_team'],'group_code':['group','group_code','group_support'],'shift':['shift','shift_code']}
-  idx={}
-  for k,names in aliases.items():
-   for a in names:
-    if hnorm(a) in hs:idx[k]=hs.index(hnorm(a));break
-  req=['employee_code','full_name','location_support','team_support','group_code','shift'];missing=[k for k in req if k not in idx]
-  if missing:raise ValueError('Excel ต้องมีคอลัมน์: employee_code, full_name, location_support, team_support, group, shift')
-  incoming={}
-  for r in ws.iter_rows(min_row=2,values_only=True):
-   emp=re.sub(r'<[^>]+>','',clean(r[idx['employee_code']])).strip().upper()
-   if emp:
-    if emp in incoming:raise ValueError('Duplicate employee code in Excel: '+emp)
-    if clean(r[idx['shift']]).upper() not in ('D','N'):raise ValueError('Shift must be D or N: '+emp)
-    incoming[emp]=(clean(r[idx['full_name']]),clean(r[idx['location_support']]),clean(r[idx['team_support']]),clean(r[idx['group_code']]).upper(),clean(r[idx['shift']]).upper())
-  wb.close()
-  if not incoming:raise ValueError('No employee rows found. Existing employees were not changed.')
-  now=datetime.now().isoformat(timespec='seconds')
-  with db() as c:
-   current={x[0] for x in c.execute('SELECT employee_code FROM employees WHERE active=1 AND department=?',(dept,))}
-   for emp in incoming:guard_department(c,emp,dept)
-   sql="INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=1,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift"
-   for emp,(name,loc,team,grp,sh) in incoming.items():c.execute(sql,(emp,name,dept,'',1,now,loc,team,grp,sh))
-   # Merge upload: omitted employees stay active. Deactivate explicitly from Employee Master.
-  return jsonify(ok=True,department=dept,total=len(incoming),added=len(set(incoming)-current),removed=0)
- except Exception as e:return jsonify(ok=False,error=str(e)),400
- finally:
-  try:path.unlink(missing_ok=True)
-  except:pass
+ # Old/cached clients must not bypass the preview + explicit confirmation flow.
+ return jsonify(ok=False,code='PREVIEW_REQUIRED',error='อัปเดตหน้าเว็บก่อน: เลือก Excel → Preview → ยืนยันอัปโหลดทับ'),409
 
 # Department-scoped browser backup/restore. This prevents one department from overwriting another.
 @app.get('/api/state/export')
@@ -547,7 +574,7 @@ def state_export():
   attendance=[]
   if codes:
    q=','.join('?'*len(codes));attendance=[dict(x) for x in c.execute(f'SELECT employee_code,name_from_web,latest_datetime,status,query_at,scan_in,scan_out,raw_count,ot_minutes,work_date FROM attendance WHERE employee_code IN ({q}) ORDER BY employee_code',codes)]
- return jsonify(ok=True,version=2,department=dept,exported_at=datetime.now().isoformat(timespec='seconds'),employees=employees,attendance=attendance)
+ return jsonify(ok=True,version=2,department=dept,exported_at=bkk_now().isoformat(timespec='seconds'),employees=employees,attendance=attendance)
 
 @app.post('/api/state/restore')
 def state_restore():
@@ -562,7 +589,7 @@ def master_export():
  dept=norm_dept(request.args.get('department',''))
  if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
  with db() as c:rows=[dict(x) for x in c.execute('SELECT employee_code,full_name,department,location_support,team_support,group_code,shift,active,updated_at FROM employees WHERE department=? ORDER BY active DESC,shift,location_support,employee_code',(dept,))]
- return jsonify(ok=True,version=2,department=dept,exported_at=datetime.now().isoformat(timespec='seconds'),employees=rows)
+ return jsonify(ok=True,version=2,department=dept,exported_at=bkk_now().isoformat(timespec='seconds'),employees=rows)
 
 @app.post('/api/master/replace')
 def master_replace():
@@ -585,7 +612,7 @@ def employee_save():
  x=request.get_json(force=True);emp=clean(x.get('employee_code')).upper();dept=norm_dept(x.get('department'))
  if not emp:return jsonify(ok=False,error='Employee No. required'),400
  if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
- ensure_department(dept);now=datetime.now().isoformat(timespec='seconds')
+ ensure_department(dept);now=bkk_now().isoformat(timespec='microseconds')
  with db() as c:
   guard_department(c,emp,dept)
   c.execute('INSERT INTO employees(employee_code,full_name,department,position,active,updated_at,location_support,team_support,group_code,shift) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(employee_code) DO UPDATE SET full_name=excluded.full_name,department=excluded.department,active=excluded.active,updated_at=excluded.updated_at,location_support=excluded.location_support,team_support=excluded.team_support,group_code=excluded.group_code,shift=excluded.shift',(emp,clean(x.get('full_name')),dept,'',1 if x.get('active',True) else 0,now,clean(x.get('location_support')),clean(x.get('team_support')),clean(x.get('group_code')).upper(),clean(x.get('shift')).upper()))
@@ -596,64 +623,73 @@ def auto_schedule_get():
  dept=norm_dept(request.args.get('department',''))
  if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
  try:
-  sched=get_auto_schedule(dept);last=last_auto_run(dept);nxt=next_auto_run(sched)
-  return jsonify(ok=True,department=dept,schedule=sched,last_run=last,next_run=nxt,store=schedule_store_kind(),persistent=(schedule_store_kind()=='postgres'),token_configured=bool(AUTO_QUERY_TOKEN))
- except Exception as e:
-  log(f'AUTO SCHEDULE GET ERROR dept={dept} {type(e).__name__}: {e}');return jsonify(ok=False,error=str(e)),500
+  ensure_auto_schedule(dept)
+  return jsonify(ok=True,store=store.kind,persistent=store.postgres,**schedules.diagnostics(dept))
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 @app.post('/api/auto-schedule')
 def auto_schedule_save_api():
  x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'))
  if not dept or dept=='ALL':return jsonify(ok=False,error='Specific department required'),400
  try:
-  ensure_department(dept);sched=save_auto_schedule(dept,x);return jsonify(ok=True,department=dept,schedule=sched,next_run=next_auto_run(sched),store=schedule_store_kind(),persistent=(schedule_store_kind()=='postgres'))
- except Exception as e:return jsonify(ok=False,error=str(e)),400
+  if not isinstance(x.get('slots'),list):return jsonify(ok=False,error='Refresh the page to V12.1.3 before changing schedules.'),409
+  schedules.save(dept,x)
+  return jsonify(ok=True,persistent=store.postgres,**schedules.diagnostics(dept))
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 @app.post('/api/auto-query/tick')
 def auto_query_tick():
  if not auto_token_ok(request):return jsonify(ok=False,error='Auto Query token missing or invalid'),401
- now=bkk_now();tasks=[]
- try:
-  with db() as c:deps=[norm_dept(x[0]) for x in c.execute("SELECT d.code FROM departments d WHERE d.active=1 AND EXISTS(SELECT 1 FROM employees e WHERE e.department=d.code AND e.active=1) ORDER BY d.code")]
-  for dept in deps:
-   sched=get_auto_schedule(dept)
-   if not sched or not sched.get('enabled') or now.weekday() not in set(sched.get('weekdays') or []):continue
-   for slot_key,time_key,mode,label in AUTO_SLOTS:
-    hhmm=sched.get(time_key)
-    if not _valid_hhmm(hhmm):continue
-    due=datetime.combine(now.date(),datetime.strptime(hhmm,'%H:%M').time(),tzinfo=BKK)
-    age=(now-due).total_seconds()/60
-    if 0<=age<=AUTO_GRACE_MINUTES and claim_auto_run(dept,slot_key,now.date().isoformat(),mode):
-     tasks.append({'department':dept,'slot_key':slot_key,'slot_date':now.date().isoformat(),'mode':mode,'label':label,'scheduled_at':due.isoformat(timespec='minutes'),'late_minutes':int(age)})
-  return jsonify(ok=True,now=now.isoformat(timespec='minutes'),tasks=tasks,grace_minutes=AUTO_GRACE_MINUTES)
- except Exception as e:
-  log(f'AUTO TICK ERROR {type(e).__name__}: {e}');return jsonify(ok=False,error=str(e)),500
+ history.capture_today()
+ source=clean((request.get_json(silent=True) or {}).get('trigger'))
+ tasks=schedules.due('GITHUB_SCHEDULE' if source=='schedule' else 'GITHUB_MANUAL' if source=='workflow_dispatch' else 'GITHUB_UNKNOWN')
+ return jsonify(ok=True,now=bkk_now().isoformat(timespec='seconds'),timezone='Asia/Bangkok',tasks=tasks,grace_minutes=AUTO_GRACE_MINUTES)
 
 @app.post('/api/auto-query/complete')
 def auto_query_complete():
  if not auto_token_ok(request):return jsonify(ok=False,error='Auto Query token missing or invalid'),401
- x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'));slot=clean(x.get('slot_key'));slot_date=clean(x.get('slot_date'))
- if not dept or not slot or not slot_date:return jsonify(ok=False,error='department, slot_key and slot_date required'),400
- complete_auto_run(dept,slot,slot_date,x.get('status'),x.get('job_id'),x.get('message'));return jsonify(ok=True)
+ x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'))
+ try:schedules.complete(dept,clean(x.get('slot_key')),clean(x.get('slot_date')),x.get('status'),clean(x.get('job_id')),clean(x.get('message')))
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),409
+ return jsonify(ok=True)
 
 @app.post('/api/query')
 def start():
- x=request.get_json(silent=True) or {};mode=clean(x.get('mode')).upper() or 'DAY';dept=norm_dept(x.get('department'));today=date.today()
+ x=request.get_json(silent=True) or {};dept=norm_dept(x.get('department'));now=bkk_now()
  if not dept or dept=='ALL':return jsonify(ok=False,error='Select one department before Query'),400
- if mode=='DAY':query_shift='D';wd=today
- elif mode=='LAST_NIGHT':query_shift='N';wd=today-timedelta(days=1)
- elif mode=='TONIGHT':query_shift='N';wd=today
- else:return jsonify(ok=False,error='Historical/custom-date query is disabled. Use TODAY DAY, LAST NIGHT, or TONIGHT.'),400
- missing_only=bool(x.get('missing_only',False));source=clean(x.get('source')).upper()
- if source not in ('AUTO','MANUAL'):source='MANUAL'
- dup_id,dup=find_duplicate_job(dept,mode,wd.isoformat(),missing_only)
- if dup_id:
-  return jsonify(ok=True,job_id=dup_id,department=dept,duplicate=True,status=dup.get('status'),source=dup.get('source','MANUAL'))
- j=uuid.uuid4().hex[:10]
- with lock:
-  jobs[j]={'status':'queued','total':0,'done':0,'current':'','message':f'Preparing {dept} missing employees...' if missing_only else f'Preparing {dept}...','department':dept,'query_shift':query_shift,'mode':mode,'work_date':wd.isoformat(),'missing_only':missing_only,'source':source,'created_at':bkk_now().isoformat(timespec='seconds')}
- threading.Thread(target=runquery,args=(j,query_shift,wd.isoformat(),missing_only,dept),daemon=True).start()
- return jsonify(ok=True,job_id=j,department=dept,duplicate=False,status='queued',source=source)
+ source=clean(x.get('source')).upper() or 'MANUAL';task=None
+ try:
+  if source=='AUTO':
+   if not auto_token_ok(request):return jsonify(ok=False,error='Update the GitHub workflow: AUTO queries require the token header.'),401
+   task=schedules.claimed(dept,clean(x.get('slot_key')),clean(x.get('slot_date')))
+   v=resolve_view(task['mode'],datetime.fromisoformat(task['scheduled_at']))
+  else:
+   source='MANUAL';v=resolve_view(x.get('mode'),now)
+   if x.get('work_date') and x['work_date']!=v['work_date']:
+    return jsonify(ok=False,error='The Thai date changed. Refresh the selected view before Query.'),409
+  mode=v['mode'];wd=v['work_date'];query_shift=v['shift']
+  history.capture_today()
+  rows=history.roster(dept,wd,query_shift)
+  if rows is None:return jsonify(ok=False,error='No saved roster for '+v['date_label']+'. Historical data is not inferred from the latest Excel.'),409
+  missing_only=bool(x.get('missing_only',False))
+  with lock:
+   # Single process/thread-safe check + insert. Same full query covers missing-only too.
+   for jid,existing in jobs.items():
+    if existing.get('status') in ('queued','running') and (existing.get('department'),existing.get('work_date'),existing.get('query_shift'))==(dept,wd,query_shift):
+     if not existing.get('missing_only') or existing.get('missing_only')==missing_only:
+      if task:schedules.attach(dept,task['slot_key'],task['slot_date'],jid)
+      return jsonify(ok=True,job_id=jid,duplicate=True,department=dept,status=existing['status'])
+   j=uuid.uuid4().hex[:12]
+   jobs[j]=dict(status='queued',total=len(rows),done=0,current='',message='Queued '+dept,
+                department=dept,query_shift=query_shift,mode=mode,work_date=wd,missing_only=missing_only,
+                source=source,trigger=clean(x.get('trigger')) or ('manual' if source=='MANUAL' else 'unknown'),
+                created_at=now.isoformat(timespec='seconds'),scheduled_at=task['scheduled_at'] if task else '',
+                started_at='',finished_at='',date_label=v['date_label'],timezone='Asia/Bangkok')
+   history.save_job(j,jobs[j])
+   if task:schedules.attach(dept,task['slot_key'],task['slot_date'],j)
+  threading.Thread(target=runquery,args=(j,query_shift,wd,missing_only,dept),daemon=True).start()
+  return jsonify(ok=True,job_id=j,department=dept,duplicate=False,status='queued',source=source,work_date=wd)
+ except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
 
 @app.get('/api/query-status')
 def query_status():
@@ -667,8 +703,14 @@ def query_status():
  recent=[x for x in rows if x.get('status') in ('done','error')]
  recent.sort(key=lambda x:x.get('finished_at') or sortkey(x),reverse=True)
  for i,x in enumerate(active,1):x['queue_position']=i
+ for x in active+recent:
+  if x.get('scheduled_at') and x.get('started_at'):
+   x['start_delay_minutes']=round(max(0,(datetime.fromisoformat(x['started_at'])-datetime.fromisoformat(x['scheduled_at'])).total_seconds()/60),1)
+ with db() as c:
+  row=c.execute("SELECT * FROM scheduler_contact WHERE id='last'").fetchone()
+  contact=dict(row) if row else None
  running=next((x for x in active if x.get('status')=='running'),None)
- return jsonify(ok=True,server_time=bkk_now().isoformat(timespec='seconds'),query_busy=query_run_lock.locked(),running=running,active=active,queued=[x for x in active if x.get('status')=='queued'],recent=recent[:8])
+ return jsonify(ok=True,server_time=bkk_now().isoformat(timespec='seconds'),timezone='Asia/Bangkok',views=[resolve_view(m,bkk_now()) for m in MODES],scheduler_contact=contact,query_busy=query_run_lock.locked(),running=running,active=active,queued=[x for x in active if x.get('status')=='queued'],recent=recent[:8])
 
 @app.get('/api/job/<j>')
 def job(j):
@@ -691,5 +733,8 @@ def import_preview():
 def import_all():
  try:return jsonify(ok=True,**recovery.import_pack(request.get_json(silent=True) or {}))
  except ValueError as exc:return jsonify(ok=False,error=str(exc)),400
+
+from master_sync import register_master_sync
+master_sync=register_master_sync(app,store,query_run_lock)
 
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')),debug=False,threaded=True)
