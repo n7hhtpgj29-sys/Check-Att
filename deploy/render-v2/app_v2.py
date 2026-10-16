@@ -30,7 +30,7 @@ def home():
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
 <p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
-<p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
+<p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label> <label>Work date <input id="work-date" type="date"></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <section id="run-panel" style="padding:16px;background:#eaf1fb;border-radius:10px;margin:12px 0"><strong id="run-status">Run status: idle</strong><div style="height:20px;background:#d2dbe9;border-radius:12px;overflow:hidden;margin-top:12px"><div id="run-bar" style="height:100%;width:0%;background:#2376d9;transition:width .4s"></div></div><p id="run-detail" style="margin:8px 0 0">0 / 0 (0%)</p></section><pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
@@ -57,7 +57,7 @@ async function progress(){
 async function runGroup(){
  const d=document.getElementById('test-dept').value,s=document.getElementById('test-shift').value;
  try{
-  const r=await fetch('/api/v2/run-group',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({department:d,shift:s})});
+  const r=await fetch('/api/v2/run-group',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({department:d,shift:s,work_date:document.getElementById('work-date').value})});
   const j=await r.json();
   if(j.job_id){showJob(j);return}
   if(j.error==='another_run_active'){runId='';await progress();return}
@@ -67,7 +67,7 @@ async function runGroup(){
 \nfunction loadSummary(){display('/api/v2/summary')}
 function loadMissing(){display('/api/v2/missing')}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
-document.getElementById('token').addEventListener('change',()=>progress());\n</script></html>"""
+document.getElementById('token').addEventListener('change',()=>progress());\nconst bangkok=new Date(Date.now()+7*3600000);if(bangkok.getUTCHours()<5)bangkok.setUTCDate(bangkok.getUTCDate()-1);document.getElementById('work-date').value=bangkok.toISOString().slice(0,10);\n</script></html>"""
 
 @app.get("/api/v2/health")
 def health():
@@ -242,7 +242,7 @@ def run_group():
             employees=[r[0] for r in cur.fetchall()]
     if not employees:return jsonify(error="empty_roster"),400
     job_id=str(uuid.uuid4())
-    if not launch(job_id,employees,shift):
+    from datetime import date as _date\n    from zoneinfo import ZoneInfo as _ZoneInfo\n    from datetime import datetime as _datetime\n    work_date=data.get("work_date") or _datetime.now(_ZoneInfo("Asia/Bangkok")).date().isoformat()\n    try:_date.fromisoformat(work_date)\n    except ValueError:return jsonify(error="invalid_work_date"),400\n    if not launch(job_id,employees,shift,work_date):
         return jsonify(error="another_run_active",**(active_job() or {})),409
     return jsonify(job_id=job_id,total=len(employees),status="running",
                    safe_to_mark_missing=False,note="Temporary in-memory progress; no attendance results saved."),202
