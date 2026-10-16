@@ -25,15 +25,17 @@ def scan_group(ids,shift,work_date):
                     deadline=time.monotonic()+7
                     found=[]
                     while time.monotonic()<deadline:
-                        rows=page.locator("table tbody tr")
-                        if not rows.count():rows=page.locator("table tr")
-                        for i in range(min(rows.count(),150)):
-                            cells=rows.nth(i).locator("td")
-                            if cells.count()<4:continue
-                            values=[x.strip() for x in cells.all_inner_texts()]
-                            if values[1].upper()!=emp.upper():continue
-                            try:found.append(datetime.strptime(values[3],"%d/%m/%Y %H:%M:%S"))
-                            except ValueError:pass
+                        rows_data=page.locator("table tr").evaluate_all(
+                            """rows => rows.slice(0,150).map(row =>
+                                Array.from(row.querySelectorAll('td'), cell =>
+                                    (cell.textContent || '').trim()))""")
+                        for values in rows_data:
+                            if len(values)<4 or values[1].upper()!=emp.upper():
+                                continue
+                            try:
+                                found.append(datetime.strptime(values[3],"%d/%m/%Y %H:%M:%S"))
+                            except ValueError:
+                                pass
                         if found:break
                         page.wait_for_timeout(200)
                     if shift=="D":
