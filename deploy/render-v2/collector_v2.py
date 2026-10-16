@@ -4,7 +4,7 @@ SOURCE = "https://webapp.calcomp.co.th/att/"
 def probe_source():
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True,args=[
+        browser = p.chromium.launch(headless=False,args=[
             "--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"
         ])
         try:
