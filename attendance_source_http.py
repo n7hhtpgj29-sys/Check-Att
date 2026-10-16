@@ -45,7 +45,12 @@ def fetch_employee_scans(
                 url,
                 data={"limit": limit, "offset": page * limit, "search_emp": employee_id},
                 timeout=timeout,
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": "https://webapp.calcomp.co.th/att/",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
             )
             response.raise_for_status()
             payload = response.json()
