@@ -29,14 +29,14 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
+<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
 <p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
 function headers(){return {'X-Admin-Token':document.getElementById('token').value}}
 async function display(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});out.textContent=JSON.stringify(await r.json(),null,2)}catch(e){out.textContent='Request failed'}}
-function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='Checking one employee...';display('/api/v2/test-one',{method:'POST'})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nfunction loadSummary(){display('/api/v2/summary')}
+function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='Checking one employee...';display('/api/v2/test-one',{method:'POST'})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nlet runId='';function runGroup(){const d=document.getElementById('test-dept').value,s=document.getElementById('test-shift').value;fetch('/api/v2/run-group',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({department:d,shift:s})}).then(r=>r.json()).then(j=>{runId=j.job_id||'';out.textContent=JSON.stringify(j,null,2)})}function progress(){if(runId)display('/api/v2/group-progress/'+runId)}\nfunction loadSummary(){display('/api/v2/summary')}
 function loadMissing(){display('/api/v2/missing')}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 </script></html>"""
@@ -195,3 +195,34 @@ def test_batch():
     except Exception:
         app.logger.exception("Batch diagnostic failed")
         return jsonify(error="batch_failed",safe_to_mark_missing=False),503
+
+@app.post("/api/v2/run-group")
+@secure
+def run_group():
+    import uuid
+    from group_runner import launch
+    data=request.get_json(silent=True) or {}
+    dept=data.get("department");shift=data.get("shift")
+    if dept not in ("PEM","TE") or shift not in ("D","N"):
+        return jsonify(error="invalid_selection"),400
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT e.employee_no FROM attendance_v2.employees e
+                JOIN attendance_v2.departments d ON d.id=e.department_id
+                WHERE e.active AND d.code=%s AND e.shift=%s
+                ORDER BY e.employee_no""",(dept,shift))
+            employees=[r[0] for r in cur.fetchall()]
+    if not employees:return jsonify(error="empty_roster"),400
+    job_id=str(uuid.uuid4())
+    if not launch(job_id,employees,shift):
+        return jsonify(error="another_run_active"),409
+    return jsonify(job_id=job_id,total=len(employees),status="running",
+                   safe_to_mark_missing=False,note="Temporary in-memory progress; no attendance results saved."),202
+
+@app.get("/api/v2/group-progress/<job_id>")
+@secure
+def group_progress(job_id):
+    from group_runner import jobs
+    job=jobs.get(job_id)
+    if job is None:return jsonify(error="job_not_found_or_worker_restarted"),404
+    return jsonify(**job,safe_to_mark_missing=False)
