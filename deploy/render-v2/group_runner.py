@@ -5,11 +5,14 @@ from collector_v2 import query_employee
 
 lock=Lock()
 jobs={}
+active_job_id=None
 
 def launch(job_id, employees, shift):
+    global active_job_id
     if not lock.acquire(blocking=False):
         return False
-    jobs[job_id]={"status":"running","total":len(employees),"done":0,"counts":{}}
+    active_job_id=job_id
+    jobs[job_id]={"status":"running","total":len(employees),"done":0,"counts":{},"shift":shift,"started_at":datetime.now().isoformat()}
     def worker():
         counts=Counter()
         try:
@@ -24,9 +27,16 @@ def launch(job_id, employees, shift):
                 counts[status]+=1
                 jobs[job_id].update(done=sum(counts.values()),counts=dict(counts))
             jobs[job_id]["status"]="completed"
+            jobs[job_id]["finished_at"]=datetime.now().isoformat()
         except Exception:
             jobs[job_id]["status"]="failed"
+            jobs[job_id]["finished_at"]=datetime.now().isoformat()
         finally:
+            global active_job_id
+            active_job_id=None
             lock.release()
     Thread(target=worker,daemon=True).start()
     return True
+
+def active_job():
+    return {"job_id":active_job_id,**jobs[active_job_id]} if active_job_id in jobs else None
