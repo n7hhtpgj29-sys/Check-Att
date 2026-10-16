@@ -29,14 +29,14 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
-<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
+<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
+<p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
 function headers(){return {'X-Admin-Token':document.getElementById('token').value}}
 async function display(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});out.textContent=JSON.stringify(await r.json(),null,2)}catch(e){out.textContent='Request failed'}}
-function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='Checking one employee...';display('/api/v2/test-one',{method:'POST'})}\nfunction loadSummary(){display('/api/v2/summary')}
+function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='Checking one employee...';display('/api/v2/test-one',{method:'POST'})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nfunction loadSummary(){display('/api/v2/summary')}
 function loadMissing(){display('/api/v2/missing')}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 </script></html>"""
@@ -159,3 +159,39 @@ def test_one():
     except Exception:
         app.logger.exception("Single scan diagnostic failed")
         return jsonify(status="QUERY_ERROR",safe_to_mark_missing=False,error="query_failed"),503
+
+@app.post("/api/v2/test-batch")
+@secure
+def test_batch():
+    """Three read-only queries. Does not store or classify missing employees."""
+    payload=request.get_json(silent=True) or {}
+    dept=payload.get("department")
+    shift=payload.get("shift")
+    if dept not in ("PEM","TE") or shift not in ("D","N"):
+        return jsonify(error="invalid_department_or_shift"),400
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT e.employee_no FROM attendance_v2.employees e
+                    JOIN attendance_v2.departments d ON d.id=e.department_id
+                    WHERE e.active AND d.code=%s AND e.shift=%s
+                    ORDER BY e.employee_no LIMIT 3""",(dept,shift))
+                employees=[r[0] for r in cur.fetchall()]
+        if not employees:
+            return jsonify(error="no_active_employees"),400
+        from collector_v2 import query_employee
+        from collections import Counter
+        outcomes=[]
+        for emp in employees:
+            try:
+                outcome=query_employee(emp,shift)
+                outcomes.append(outcome.get("status","QUERY_ERROR"))
+            except Exception:
+                app.logger.exception("Batch diagnostic query failed")
+                outcomes.append("QUERY_ERROR")
+        return jsonify(department=dept,shift=shift,tested=len(outcomes),
+                       counts=dict(Counter(outcomes)),safe_to_mark_missing=False,
+                       note="Read-only diagnostic; no attendance runs or missing records saved.")
+    except Exception:
+        app.logger.exception("Batch diagnostic failed")
+        return jsonify(error="batch_failed",safe_to_mark_missing=False),503
