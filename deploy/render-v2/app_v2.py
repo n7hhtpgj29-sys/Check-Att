@@ -242,7 +242,15 @@ def run_group():
             employees=[r[0] for r in cur.fetchall()]
     if not employees:return jsonify(error="empty_roster"),400
     job_id=str(uuid.uuid4())
-    from datetime import date as _date\n    from zoneinfo import ZoneInfo as _ZoneInfo\n    from datetime import datetime as _datetime\n    work_date=data.get("work_date") or _datetime.now(_ZoneInfo("Asia/Bangkok")).date().isoformat()\n    try:_date.fromisoformat(work_date)\n    except ValueError:return jsonify(error="invalid_work_date"),400\n    if not launch(job_id,employees,shift,work_date):
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    from datetime import datetime as _datetime
+    work_date=data.get("work_date") or _datetime.now(_ZoneInfo("Asia/Bangkok")).date().isoformat()
+    try:
+        _date.fromisoformat(work_date)
+    except ValueError:
+        return jsonify(error="invalid_work_date"),400
+    if not launch(job_id,employees,shift,work_date):
         return jsonify(error="another_run_active",**(active_job() or {})),409
     return jsonify(job_id=job_id,total=len(employees),status="running",
                    safe_to_mark_missing=False,note="Temporary in-memory progress; no attendance results saved."),202
