@@ -11,6 +11,7 @@ def scan_group(ids,shift,work_date):
         try:
             context=browser.new_context(ignore_https_errors=True,locale="en-US",timezone_id="Asia/Bangkok",viewport={"width":1280,"height":900},user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
             context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            context.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image","font","media") else route.continue_())
             page=context.new_page()
             for emp in ids:
                 try:
