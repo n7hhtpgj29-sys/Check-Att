@@ -29,14 +29,14 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
+<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
 <p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
 function headers(){return {'X-Admin-Token':document.getElementById('token').value}}
 async function display(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});out.textContent=JSON.stringify(await r.json(),null,2)}catch(e){out.textContent='Request failed'}}
-function loadSummary(){display('/api/v2/summary')}
+function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction loadSummary(){display('/api/v2/summary')}
 function loadMissing(){display('/api/v2/missing')}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 </script></html>"""
@@ -130,3 +130,14 @@ def import_employees():
         return jsonify(error="csv_must_be_utf8"),400
     except Exception:
         return jsonify(error="import_failed"),503
+
+@app.post("/api/v2/source-probe")
+@secure
+def source_probe():
+    """Manual source connectivity only; never writes attendance or marks missing."""
+    try:
+        from collector_v2 import probe_source
+        return jsonify(probe_source())
+    except Exception:
+        app.logger.exception("V2 source probe failed")
+        return jsonify(source="unavailable",safe_to_mark_missing=False,error="browser_or_network_failure"),503
