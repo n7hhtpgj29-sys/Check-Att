@@ -365,12 +365,80 @@ def _format_no_scan_message(report):
         lines.append("ไม่พบรายชื่อผู้ยังไม่สแกน")
     return "\n".join(lines)
 
+
+def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
+    """Read a completed, durable ALL-department result; never return partial runs."""
+    from collections import Counter
+    conditions=["r.status='completed'","d.code='ALL'"]
+    args=[]
+    if shift:
+        conditions.append("r.shift=%s")
+        args.append(shift)
+    if work_date:
+        conditions.append("r.work_date=%s")
+        args.append(work_date)
+    if scheduled_only:
+        conditions.append("r.trigger_type='scheduled'")
+    query="""SELECT r.id,r.shift,r.work_date,r.total_employees,
+                    r.trigger_type,r.scheduled_key
+             FROM attendance_v2.attendance_runs r
+             JOIN attendance_v2.departments d ON d.id=r.department_id
+             WHERE """+" AND ".join(conditions)+" ORDER BY r.finished_at DESC,r.id DESC LIMIT 1"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query,tuple(args))
+            row=cur.fetchone()
+            if row is None:
+                return None
+            run_id,s,day,total,trigger_type,key=row
+            cur.execute("""SELECT a.employee_no,e.full_name,d.code,a.status
+                           FROM attendance_v2.attendance_results a
+                           JOIN attendance_v2.employees e ON e.employee_no=a.employee_no
+                           JOIN attendance_v2.departments d ON d.id=e.department_id
+                           WHERE a.run_id=%s ORDER BY d.code,a.employee_no""",(run_id,))
+            rows=cur.fetchall()
+    if len(rows)!=total or total==0:
+        return None
+    counts=Counter(r[3] for r in rows)
+    missing=[{"employee_no":r[0],"name":r[1],"department":r[2]}
+             for r in rows if r[3]=="NO_SCAN_IN_WINDOW"]
+    department_counts=dict(sorted(Counter(r["department"] for r in missing).items()))
+    return {"department_counts":department_counts,
+            "job_id":key or "V2:DB:"+str(run_id),
+            "department":"ALL","shift":s,"work_date":str(day),
+            "trigger_type":trigger_type,"status":"completed",
+            "total":total,"scanned":counts.get("SCAN_FOUND",0),
+            "no_scan":len(missing),"unverified":counts.get("INCOMPLETE",0),
+            "query_errors":counts.get("QUERY_ERROR",0),"employees":missing}
+
 @app.get("/api/v2/no-scan-list")
 @secure
 def no_scan_list():
-    report=_no_scan_report()
-    if not report:return jsonify(error="no_completed_run",employees=[]),404
-    return jsonify(**report,line_message=_format_no_scan_message(report),note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
+    shift=request.args.get("shift")
+    work_date=request.args.get("work_date")
+    scheduled_only=request.args.get("scheduled_only")=="1"
+    if bool(shift) != bool(work_date):
+        return jsonify(error="shift_and_work_date_must_be_paired"),400
+    if shift and shift not in ("D","N"):
+        return jsonify(error="invalid_shift"),400
+    if work_date:
+        from datetime import date as _date
+        try:
+            _date.fromisoformat(work_date)
+        except ValueError:
+            return jsonify(error="invalid_work_date"),400
+    try:
+        if shift or scheduled_only:
+            report=_db_no_scan_report(shift,work_date,scheduled_only)
+        else:
+            report=_no_scan_report() or _db_no_scan_report()
+    except Exception:
+        app.logger.exception("Failed to read V2 completed report")
+        return jsonify(error="report_database_unavailable"),503
+    if not report:
+        return jsonify(error="no_matching_completed_run",shift=shift,work_date=work_date),404
+    return jsonify(**report,line_message=_format_no_scan_message(report),
+                   note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
 
 @app.post("/api/v2/send-line")
 @secure
@@ -425,6 +493,14 @@ def scheduled_run():
         return jsonify(error='invalid_work_date'),400
     if abs((_date.today()-day).days)>7:
         return jsonify(error='date_outside_allowed_range'),400
+    try:
+        completed=_db_no_scan_report(shift,work_date,scheduled_only=True)
+    except Exception:
+        app.logger.exception("Failed to check previously completed schedule")
+        return jsonify(error="schedule_database_unavailable"),503
+    if completed:
+        return jsonify(job_id=completed["job_id"],status="completed",already_exists=True,
+                       total=completed["total"]),200
     for jid,j in reversed(list(jobs.items())):
         if j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
             return jsonify(job_id=jid,status=j['status'],already_exists=True),200
@@ -438,6 +514,6 @@ def scheduled_run():
     names={r[0]:r[1] for r in roster}
     depts={r[0]:r[2] for r in roster}
     jid=str(uuid.uuid4())
-    if not launch(jid,ids,shift,work_date,'ALL',names,depts):
+    if not launch(jid,ids,shift,work_date,'ALL',names,depts,trigger_type='scheduled'):
         return jsonify(error='another_run_active',active=active_job()),409
     return jsonify(job_id=jid,status='running',total=len(ids)),202
