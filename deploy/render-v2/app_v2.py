@@ -79,7 +79,15 @@ async function loadMissing(){
    'Total HC: '+j.total,'Present: '+j.scanned,
    'No Scan: '+j.no_scan,'Query Error: '+j.query_errors,
    'ตรวจไม่ครบ: '+j.unverified,'','รายชื่อผู้ยังไม่สแกน:'];
-  for(const e of j.employees)lines.push('• ['+e.department+'] '+e.employee_no+' - '+e.name);
+  const grouped={};
+  for(const e of j.employees){(grouped[e.department]??=[]).push(e)}
+  const departments=Object.keys(grouped).sort();
+  lines.push('สรุปแยกแผนก:');
+  for(const d of departments)lines.push(d+': '+grouped[d].length+' คน');
+  for(const d of departments){
+   lines.push('','['+d+'] — '+grouped[d].length+' คน');
+   for(const e of grouped[d].sort((a,b)=>a.employee_no.localeCompare(b.employee_no)))lines.push('• '+e.employee_no+' - '+e.name);
+  }
   if(!j.employees.length)lines.push('ไม่พบรายชื่อผู้ยังไม่สแกน');
   out.textContent=lines.join(String.fromCharCode(10));
  }catch(e){out.textContent='โหลดสรุปไม่สำเร็จ: '+e.message}
@@ -319,7 +327,10 @@ def _no_scan_report():
         return None
     missing=[{"employee_no":r["employee_no"],"name":r["name"],"department":r.get("department",job["department"])}
              for r in job.get("results",[]) if r["status"]=="NO_SCAN_IN_WINDOW"]
-    return {"job_id":jid,"department":job["department"],"shift":job["shift"],
+    missing.sort(key=lambda r:(r["department"],r["employee_no"]))
+    from collections import Counter
+    department_counts=dict(sorted(Counter(r["department"] for r in missing).items()))
+    return {"department_counts":department_counts,"job_id":jid,"department":job["department"],"shift":job["shift"],
             "work_date":job["work_date"],"total":job["total"],
             "scanned":job["counts"].get("SCAN_FOUND",0),
             "no_scan":len(missing),
