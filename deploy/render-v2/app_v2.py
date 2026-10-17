@@ -365,3 +365,37 @@ def send_line():
     except Exception:
         app.logger.exception("LINE push failed")
         return jsonify(error="line_send_failed"),502
+
+@app.post('/api/v2/scheduled-run')
+@secure
+def scheduled_run():
+    from datetime import date as _date
+    import uuid
+    from group_runner import launch,active_job,jobs
+    payload=request.get_json(silent=True) or {}
+    shift=payload.get('shift')
+    work_date=payload.get('work_date')
+    if shift not in ('D','N') or not isinstance(work_date,str):
+        return jsonify(error='shift_and_work_date_required'),400
+    try:
+        day=_date.fromisoformat(work_date)
+    except ValueError:
+        return jsonify(error='invalid_work_date'),400
+    if abs((_date.today()-day).days)>7:
+        return jsonify(error='date_outside_allowed_range'),400
+    for jid,j in reversed(list(jobs.items())):
+        if j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
+            return jsonify(job_id=jid,status=j['status'],already_exists=True),200
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
+            roster=cur.fetchall()
+    if not roster:
+        return jsonify(error='empty_roster'),409
+    ids=[r[0] for r in roster]
+    names={r[0]:r[1] for r in roster}
+    depts={r[0]:r[2] for r in roster}
+    jid=str(uuid.uuid4())
+    if not launch(jid,ids,shift,work_date,'ALL',names,depts):
+        return jsonify(error='another_run_active',active=active_job()),409
+    return jsonify(job_id=jid,status='running',total=len(ids)),202
