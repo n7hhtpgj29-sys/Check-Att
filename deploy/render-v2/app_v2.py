@@ -363,7 +363,7 @@ def _format_no_scan_message(report):
         lines += ["• "+r["employee_no"]+" - "+r["name"] for r in report["employees"] if r["department"]==dept]
     if not report["employees"]:
         lines.append("ไม่พบรายชื่อผู้ยังไม่สแกน")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 @app.get("/api/v2/no-scan-list")
 @secure
