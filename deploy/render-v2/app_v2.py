@@ -502,10 +502,10 @@ def scheduled_run():
         return jsonify(error="schedule_database_unavailable"),503
     if completed:
         return jsonify(job_id=completed["job_id"],status="completed",already_exists=True,
-                       total=completed["total"]),200
+                       total=completed["total"],shift=shift,work_date=work_date),200
     for jid,j in reversed(list(jobs.items())):
-        if j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
-            return jsonify(job_id=jid,status=j['status'],already_exists=True),200
+        if j.get('trigger_type')=='scheduled' and j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
+            return jsonify(job_id=jid,status=j['status'],already_exists=True,shift=shift,work_date=work_date),200
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute('SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
@@ -518,4 +518,4 @@ def scheduled_run():
     jid=str(uuid.uuid4())
     if not launch(jid,ids,shift,work_date,'ALL',names,depts,trigger_type='scheduled'):
         return jsonify(error='another_run_active',active=active_job()),409
-    return jsonify(job_id=jid,status='running',total=len(ids)),202
+    return jsonify(job_id=jid,status='running',total=len(ids),shift=shift,work_date=work_date),202
