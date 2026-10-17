@@ -338,12 +338,39 @@ def _no_scan_report():
             "query_errors":job["counts"].get("QUERY_ERROR",0),
             "employees":missing}
 
+def _format_no_scan_message(report):
+    from datetime import timedelta
+    day=datetime.strptime(report["work_date"],"%Y-%m-%d").date()
+    date_label=day.strftime("%d/%m/%Y")
+    if report["shift"]=="N":
+        date_label+=" → "+(day+timedelta(days=1)).strftime("%d/%m/%Y")
+    lines=["🚨 Attendance — ผู้ยังไม่สแกน",
+           "วันที่: "+date_label,
+           "กะ: "+report["shift"]+" | ทุกแผนก",
+           "",
+           "Total HC: "+str(report["total"]),
+           "Present: "+str(report["scanned"]),
+           "No Scan: "+str(report["no_scan"]),
+           "Query Error: "+str(report["query_errors"]),
+           "ตรวจไม่ครบ: "+str(report["unverified"]),
+           "",
+           "สรุปแยกแผนก:"]
+    lines += [dept+": "+str(count)+" คน" for dept,count in report["department_counts"].items()]
+    lines.append("")
+    lines.append("รายชื่อผู้ยังไม่สแกน:")
+    for dept,count in report["department_counts"].items():
+        lines.append("["+dept+"] — "+str(count)+" คน")
+        lines += ["• "+r["employee_no"]+" - "+r["name"] for r in report["employees"] if r["department"]==dept]
+    if not report["employees"]:
+        lines.append("ไม่พบรายชื่อผู้ยังไม่สแกน")
+    return "\\n".join(lines)
+
 @app.get("/api/v2/no-scan-list")
 @secure
 def no_scan_list():
     report=_no_scan_report()
     if not report:return jsonify(error="no_completed_run",employees=[]),404
-    return jsonify(**report,note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
+    return jsonify(**report,line_message=_format_no_scan_message(report),note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
 
 @app.post("/api/v2/send-line")
 @secure
