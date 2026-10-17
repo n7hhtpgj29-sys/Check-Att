@@ -7,7 +7,7 @@ lock=Lock()
 jobs={}
 active_job_id=None
 
-def launch(job_id, employees, shift, work_date, department, employee_names):
+def launch(job_id, employees, shift, work_date, department, employee_names, employee_departments=None):
     global active_job_id
     if not lock.acquire(blocking=False):
         return False
@@ -19,7 +19,7 @@ def launch(job_id, employees, shift, work_date, department, employee_names):
             for employee_no,status in zip(employees,scan_group(employees,shift,work_date)):
                 if status not in ("SCAN_FOUND","NO_SCAN_IN_WINDOW","INCOMPLETE","QUERY_ERROR"):status="QUERY_ERROR"
                 counts[status]+=1
-                jobs[job_id]["results"].append({"employee_no":employee_no,"name":employee_names.get(employee_no,""),"status":status})
+                jobs[job_id]["results"].append({"employee_no":employee_no,"name":employee_names.get(employee_no,""),"department":(employee_departments or {}).get(employee_no,department),"status":status})
                 jobs[job_id].update(done=sum(counts.values()),counts=dict(counts))
             jobs[job_id]["status"]="completed"
             jobs[job_id]["finished_at"]=datetime.now().isoformat()
