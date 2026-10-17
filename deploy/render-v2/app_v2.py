@@ -436,8 +436,10 @@ def no_scan_list():
         app.logger.exception("Failed to read V2 completed report")
         return jsonify(error="report_database_unavailable"),503
     if not report:
+        if scheduled_only:
+            return jsonify(ready=False,status="not_ready",shift=shift,work_date=work_date),200
         return jsonify(error="no_matching_completed_run",shift=shift,work_date=work_date),404
-    return jsonify(**report,line_message=_format_no_scan_message(report),
+    return jsonify(ready=True,**report,line_message=_format_no_scan_message(report),
                    note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
 
 @app.post("/api/v2/send-line")
