@@ -29,7 +29,7 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">Review unverified scans</button></p>
+<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View no-scan list</button> <button onclick="sendLine()">Send LINE</button></p>
 <p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label> <label>Work date <input id="work-date" type="date"></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <section id="run-panel" style="padding:16px;background:#eaf1fb;border-radius:10px;margin:12px 0"><strong id="run-status">Run status: idle</strong><div style="height:20px;background:#d2dbe9;border-radius:12px;overflow:hidden;margin-top:12px"><div id="run-bar" style="height:100%;width:0%;background:#2376d9;transition:width .4s"></div></div><p id="run-detail" style="margin:8px 0 0">0 / 0 (0%)</p></section><pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
@@ -65,7 +65,7 @@ async function runGroup(){
  }catch(e){out.textContent='Run request failed'}
 }
 \nfunction loadSummary(){display('/api/v2/summary')}
-function loadMissing(){display('/api/v2/review-candidates')}
+function loadMissing(){display('/api/v2/no-scan-list')}\nfunction sendLine(){if(!confirm('Send the latest completed no-scan list to the configured LINE recipient?'))return;display('/api/v2/send-line',{method:'POST'})}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 document.getElementById('token').addEventListener('change',()=>progress());\nconst bangkok=new Date(Date.now()+7*3600000);if(bangkok.getUTCHours()<5)bangkok.setUTCDate(bangkok.getUTCDate()-1);document.getElementById('work-date').value=bangkok.toISOString().slice(0,10);\n</script></html>"""
 
@@ -289,3 +289,60 @@ def review_candidates():
                 "candidates":candidates})
     return jsonify(review_only=True,confirmed_absent=0,runs=result,
                    note="Unverified scans are not confirmed absences. In-memory only.")
+
+def _latest_completed_job():
+    from group_runner import jobs
+    return next(((jid,j) for jid,j in reversed(list(jobs.items())) if j.get("status")=="completed"),(None,None))
+
+def _no_scan_report():
+    jid,job=_latest_completed_job()
+    if not job:
+        return None
+    missing=[{"employee_no":r["employee_no"],"name":r["name"]}
+             for r in job.get("results",[]) if r["status"]=="NO_SCAN_IN_WINDOW"]
+    return {"job_id":jid,"department":job["department"],"shift":job["shift"],
+            "work_date":job["work_date"],"total":job["total"],
+            "scanned":job["counts"].get("SCAN_FOUND",0),
+            "no_scan":len(missing),
+            "unverified":job["counts"].get("INCOMPLETE",0),
+            "query_errors":job["counts"].get("QUERY_ERROR",0),
+            "employees":missing}
+
+@app.get("/api/v2/no-scan-list")
+@secure
+def no_scan_list():
+    report=_no_scan_report()
+    if not report:return jsonify(error="no_completed_run",employees=[]),404
+    return jsonify(**report,note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
+
+@app.post("/api/v2/send-line")
+@secure
+def send_line():
+    import urllib.request,json
+    report=_no_scan_report()
+    if not report:return jsonify(error="no_completed_run"),409
+    token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
+    recipient=os.getenv("LINE_TO_ID","")
+    if not token or not recipient:
+        return jsonify(error="line_not_configured",
+                       required=["LINE_CHANNEL_ACCESS_TOKEN","LINE_TO_ID"]),409
+    lines=["Attendance — No scan detected",
+           f"{report['department']} / {report['shift']} / {report['work_date']}",
+           f"Total: {report['total']} | Scanned: {report['scanned']} | No scan: {report['no_scan']}",
+           f"Unverified: {report['unverified']} | Query errors: {report['query_errors']}"]
+    lines += [f"{i}. {r['employee_no']} {r['name']}" for i,r in enumerate(report["employees"],1)]
+    lines.append("No scan is not confirmed absence; check leave records.")
+    message="\\n".join(lines)
+    if len(message)>4800:
+        return jsonify(error="line_message_too_long"),409
+    payload=json.dumps({"to":recipient,"messages":[{"type":"text","text":message}]}).encode()
+    req=urllib.request.Request("https://api.line.me/v2/bot/message/push",
+        data=payload,headers={"Authorization":"Bearer "+token,
+        "Content-Type":"application/json"},method="POST")
+    try:
+        with urllib.request.urlopen(req,timeout=12) as response:
+            if response.status!=200:return jsonify(error="line_send_failed"),502
+        return jsonify(sent=True,job_id=report["job_id"],no_scan=report["no_scan"])
+    except Exception:
+        app.logger.exception("LINE push failed")
+        return jsonify(error="line_send_failed"),502
