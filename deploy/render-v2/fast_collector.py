@@ -13,12 +13,16 @@ def scan_group(ids,shift,work_date):
             context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             context.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image","font","media") else route.continue_())
             page=context.new_page()
+            page_ready=False
             for emp in ids:
                 try:
-                    response=page.goto(SOURCE,wait_until="domcontentloaded",timeout=20000)
-                    if not response or response.status!=200:
-                        yield "QUERY_ERROR"
-                        continue
+                    if not page_ready or page.locator("input").count()==0:
+                        response=page.goto(SOURCE,wait_until="domcontentloaded",timeout=20000)
+                        if not response or response.status!=200:
+                            page_ready=False
+                            yield "QUERY_ERROR"
+                            continue
+                        page_ready=True
                     page.locator("input").first.fill(emp,timeout=8000)
                     button=page.get_by_role("button",name="GO")
                     button.click(timeout=8000,no_wait_after=True)
@@ -44,6 +48,7 @@ def scan_group(ids,shift,work_date):
                         matched=[x for x in found if datetime.combine(day,dtime(16))<=x<datetime.combine(day+timedelta(days=1),dtime(12))]
                     yield "SCAN_FOUND" if matched else "INCOMPLETE"
                 except Exception:
+                    page_ready=False
                     yield "QUERY_ERROR"
         finally:
             browser.close()
