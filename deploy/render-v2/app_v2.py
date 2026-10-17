@@ -332,7 +332,7 @@ def send_line():
            f"Unverified: {report['unverified']} | Query errors: {report['query_errors']}"]
     lines += [f"{i}. {r['employee_no']} {r['name']}" for i,r in enumerate(report["employees"],1)]
     lines.append("No scan is not confirmed absence; check leave records.")
-    message="\\n".join(lines)
+    message="\n".join(lines)
     if len(message)>4800:
         return jsonify(error="line_message_too_long"),409
     payload=json.dumps({"to":recipient,"messages":[{"type":"text","text":message}]}).encode()
