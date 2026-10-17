@@ -17,7 +17,7 @@ def launch(job_id, employees, shift, work_date, department, employee_names):
         counts=Counter()
         try:
             for employee_no,status in zip(employees,scan_group(employees,shift,work_date)):
-                if status not in ("SCAN_FOUND","INCOMPLETE","QUERY_ERROR"):status="QUERY_ERROR"
+                if status not in ("SCAN_FOUND","NO_SCAN_IN_WINDOW","INCOMPLETE","QUERY_ERROR"):status="QUERY_ERROR"
                 counts[status]+=1
                 jobs[job_id]["results"].append({"employee_no":employee_no,"name":employee_names.get(employee_no,""),"status":status})
                 jobs[job_id].update(done=sum(counts.values()),counts=dict(counts))
