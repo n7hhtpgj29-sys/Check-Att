@@ -29,8 +29,9 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View no-scan list</button> <button onclick="sendLine()">Send LINE</button></p>
-<p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label> <label>Work date <input id="work-date" type="date"></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
+<p><label>กะ <select id="test-shift"><option value="D">Today (D)</option><option value="N">Tonight (N)</option></select></label> <label>วันที่ <input id="work-date" type="date"></label></p>
+<p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="sendLine()">ส่ง LINE</button></p>
+<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <section id="run-panel" style="padding:16px;background:#eaf1fb;border-radius:10px;margin:12px 0"><strong id="run-status">Run status: idle</strong><div style="height:20px;background:#d2dbe9;border-radius:12px;overflow:hidden;margin-top:12px"><div id="run-bar" style="height:100%;width:0%;background:#2376d9;transition:width .4s"></div></div><p id="run-detail" style="margin:8px 0 0">0 / 0 (0%)</p></section><pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
@@ -55,7 +56,7 @@ async function progress(){
  }catch(e){out.textContent='Progress request failed'}
 }
 async function runGroup(){
- const d=document.getElementById('test-dept').value,s=document.getElementById('test-shift').value;
+ const d='ALL',s=document.getElementById('test-shift').value;
  try{
   const r=await fetch('/api/v2/run-group',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({department:d,shift:s,work_date:document.getElementById('work-date').value})});
   const j=await r.json();
@@ -231,7 +232,7 @@ def run_group():
     from group_runner import launch, active_job
     data=request.get_json(silent=True) or {}
     dept=data.get("department");shift=data.get("shift")
-    if dept not in ("PEM","TE") or shift not in ("D","N"):
+    if dept not in ("PEM","TE","ALL") or shift not in ("D","N"):
         return jsonify(error="invalid_selection"),400
     with connect() as conn:
         with conn.cursor() as cur:
