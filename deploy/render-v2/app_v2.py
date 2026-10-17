@@ -360,7 +360,11 @@ def send_line():
            f"{report['department']} / {report['shift']} / {report['work_date']}",
            f"Total: {report['total']} | Scanned: {report['scanned']} | No scan: {report['no_scan']}",
            f"Unverified: {report['unverified']} | Query errors: {report['query_errors']}"]
-    lines += [f"• [{r['department']}] {r['employee_no']} - {r['name']}" for i,r in enumerate(report["employees"],1)]
+    lines.append('สรุปแยกแผนก:')
+    lines += [f'{dept}: {count} คน' for dept,count in report['department_counts'].items()]
+    for dept,count in report['department_counts'].items():
+        lines.append(f'[{dept}] — {count} คน')
+        lines += ['• '+r['employee_no']+' - '+r['name'] for r in report['employees'] if r['department']==dept]
     lines.append("No scan is not confirmed absence; check leave records.")
     message="\n".join(lines)
     if len(message)>4800:
