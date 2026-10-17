@@ -236,13 +236,14 @@ def run_group():
         return jsonify(error="invalid_selection"),400
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT e.employee_no,e.full_name FROM attendance_v2.employees e
+            cur.execute("""SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e
                 JOIN attendance_v2.departments d ON d.id=e.department_id
-                WHERE e.active AND d.code=%s AND e.shift=%s
-                ORDER BY e.employee_no""",(dept,shift))
+                WHERE e.active AND (%s='ALL' OR d.code=%s) AND e.shift=%s
+                ORDER BY e.employee_no""",(dept,dept,shift))
             roster=cur.fetchall()
             employees=[r[0] for r in roster]
             employee_names={r[0]:r[1] for r in roster}
+            employee_departments={r[0]:r[2] for r in roster}
     if not employees:return jsonify(error="empty_roster"),400
     job_id=str(uuid.uuid4())
     from datetime import date as _date
@@ -253,7 +254,7 @@ def run_group():
         _date.fromisoformat(work_date)
     except ValueError:
         return jsonify(error="invalid_work_date"),400
-    if not launch(job_id,employees,shift,work_date,dept,employee_names):
+    if not launch(job_id,employees,shift,work_date,dept,employee_names,employee_departments):
         return jsonify(error="another_run_active",**(active_job() or {})),409
     return jsonify(job_id=job_id,total=len(employees),status="running",
                    safe_to_mark_missing=False,note="Temporary in-memory progress; no attendance results saved."),202
@@ -299,7 +300,7 @@ def _no_scan_report():
     jid,job=_latest_completed_job()
     if not job:
         return None
-    missing=[{"employee_no":r["employee_no"],"name":r["name"]}
+    missing=[{"employee_no":r["employee_no"],"name":r["name"],"department":r.get("department",job["department"])}
              for r in job.get("results",[]) if r["status"]=="NO_SCAN_IN_WINDOW"]
     return {"job_id":jid,"department":job["department"],"shift":job["shift"],
             "work_date":job["work_date"],"total":job["total"],
