@@ -66,7 +66,22 @@ async function runGroup(){
  }catch(e){out.textContent='Run request failed'}
 }
 \nfunction loadSummary(){display('/api/v2/summary')}
-function loadMissing(){display('/api/v2/no-scan-list')}\nfunction sendLine(){if(!confirm('Send the latest completed no-scan list to the configured LINE recipient?'))return;display('/api/v2/send-line',{method:'POST'})}
+async function loadMissing(){
+ out.textContent='กำลังโหลดสรุปรายชื่อ...';
+ try{
+  const r=await fetch('/api/v2/no-scan-list',{headers:headers()});
+  const j=await r.json();
+  if(!r.ok){out.textContent='ยังไม่มีผลการตรวจที่เสร็จสมบูรณ์: '+(j.error||r.status);return}
+  const lines=['🚨 Attendance — ผู้ยังไม่สแกน',
+   'วันที่: '+j.work_date,'กะ: '+j.shift+' | ทุกแผนก',
+   'Total HC: '+j.total,'Present: '+j.scanned,
+   'No Scan: '+j.no_scan,'Query Error: '+j.query_errors,
+   'ตรวจไม่ครบ: '+j.unverified,'','รายชื่อผู้ยังไม่สแกน:'];
+  for(const e of j.employees)lines.push('• ['+e.department+'] '+e.employee_no+' - '+e.name);
+  if(!j.employees.length)lines.push('ไม่พบรายชื่อผู้ยังไม่สแกน');
+  out.textContent=lines.join(String.fromCharCode(10));
+ }catch(e){out.textContent='โหลดสรุปไม่สำเร็จ: '+e.message}
+}\nfunction sendLine(){if(!confirm('Send the latest completed no-scan list to the configured LINE recipient?'))return;display('/api/v2/send-line',{method:'POST'})}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 document.getElementById('token').addEventListener('change',()=>progress());\nconst bangkok=new Date(Date.now()+7*3600000);if(bangkok.getUTCHours()<5)bangkok.setUTCDate(bangkok.getUTCDate()-1);document.getElementById('work-date').value=bangkok.toISOString().slice(0,10);\n</script></html>"""
 
