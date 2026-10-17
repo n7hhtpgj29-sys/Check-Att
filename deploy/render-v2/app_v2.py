@@ -29,7 +29,7 @@ def home():
 <title>Attendance V2 Staging</title><style>body{font:16px system-ui;max-width:850px;margin:40px auto;padding:18px;background:#f5f7fb;color:#17253d}main{background:white;padding:28px;border-radius:14px}input,button{padding:10px;margin:5px 0}input[type=password]{width:95%}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#f1f4f9;padding:12px;border-radius:8px}</style>
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. No automatic collector or LINE sending yet.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
-<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">View missing candidates</button></p>
+<p><button onclick="sourceProbe()">Test source connection</button> <button onclick="testOne()">Test one scan</button> <button onclick="testBatch()">Test 3 scans</button> <button onclick="runGroup()">Run group</button> <button onclick="progress()">Progress</button> <button onclick="loadSummary()">View summary</button> <button onclick="loadMissing()">Review unverified scans</button></p>
 <p><label>Test department <select id="test-dept"><option>PEM</option><option>TE</option></select></label> <label>Shift <select id="test-shift"><option>D</option><option>N</option></select></label> <label>Work date <input id="work-date" type="date"></label></p>\n<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
 <section id="run-panel" style="padding:16px;background:#eaf1fb;border-radius:10px;margin:12px 0"><strong id="run-status">Run status: idle</strong><div style="height:20px;background:#d2dbe9;border-radius:12px;overflow:hidden;margin-top:12px"><div id="run-bar" style="height:100%;width:0%;background:#2376d9;transition:width .4s"></div></div><p id="run-detail" style="margin:8px 0 0">0 / 0 (0%)</p></section><pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
@@ -65,7 +65,7 @@ async function runGroup(){
  }catch(e){out.textContent='Run request failed'}
 }
 \nfunction loadSummary(){display('/api/v2/summary')}
-function loadMissing(){display('/api/v2/missing')}
+function loadMissing(){display('/api/v2/review-candidates')}
 function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
 document.getElementById('token').addEventListener('change',()=>progress());\nconst bangkok=new Date(Date.now()+7*3600000);if(bangkok.getUTCHours()<5)bangkok.setUTCDate(bangkok.getUTCDate()-1);document.getElementById('work-date').value=bangkok.toISOString().slice(0,10);\n</script></html>"""
 
@@ -235,11 +235,13 @@ def run_group():
         return jsonify(error="invalid_selection"),400
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT e.employee_no FROM attendance_v2.employees e
+            cur.execute("""SELECT e.employee_no,e.full_name FROM attendance_v2.employees e
                 JOIN attendance_v2.departments d ON d.id=e.department_id
                 WHERE e.active AND d.code=%s AND e.shift=%s
                 ORDER BY e.employee_no""",(dept,shift))
-            employees=[r[0] for r in cur.fetchall()]
+            roster=cur.fetchall()
+            employees=[r[0] for r in roster]
+            employee_names={r[0]:r[1] for r in roster}
     if not employees:return jsonify(error="empty_roster"),400
     job_id=str(uuid.uuid4())
     from datetime import date as _date
@@ -250,7 +252,7 @@ def run_group():
         _date.fromisoformat(work_date)
     except ValueError:
         return jsonify(error="invalid_work_date"),400
-    if not launch(job_id,employees,shift,work_date):
+    if not launch(job_id,employees,shift,work_date,dept,employee_names):
         return jsonify(error="another_run_active",**(active_job() or {})),409
     return jsonify(job_id=job_id,total=len(employees),status="running",
                    safe_to_mark_missing=False,note="Temporary in-memory progress; no attendance results saved."),202
@@ -271,3 +273,19 @@ def active_group():
     if job is None:
         return jsonify(status="idle",total=0,done=0,counts={})
     return jsonify(**job,safe_to_mark_missing=False)
+
+@app.get("/api/v2/review-candidates")
+@secure
+def review_candidates():
+    from group_runner import jobs
+    result=[]
+    for job_id,job in reversed(list(jobs.items())[-10:]):
+        candidates=[{"employee_no":r["employee_no"],"name":r["name"],"status":r["status"]}
+                    for r in job.get("results",[]) if r["status"] in ("INCOMPLETE","QUERY_ERROR")]
+        if candidates:
+            result.append({"job_id":job_id,"department":job.get("department"),
+                "shift":job.get("shift"),"work_date":job.get("work_date"),
+                "run_status":job["status"],"checked":job["done"],"total":job["total"],
+                "candidates":candidates})
+    return jsonify(review_only=True,confirmed_absent=0,runs=result,
+                   note="Unverified scans are not confirmed absences. In-memory only.")
