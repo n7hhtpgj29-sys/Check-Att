@@ -46,7 +46,14 @@ def scan_group(ids,shift,work_date):
                         matched=[x for x in found if x.date()==day and x.time()<dtime(12)]
                     else:
                         matched=[x for x in found if datetime.combine(day,dtime(16))<=x<datetime.combine(day+timedelta(days=1),dtime(12))]
-                    yield "SCAN_FOUND" if matched else "INCOMPLETE"
+                    now=datetime.now(ZoneInfo('Asia/Bangkok'))
+                    start=datetime.combine(day,dtime(8,0) if shift=='D' else dtime(20,0),ZoneInfo('Asia/Bangkok'))
+                    if matched:
+                        yield 'SCAN_FOUND'
+                    elif found and now>=start:
+                        yield 'NO_SCAN_IN_WINDOW'
+                    else:
+                        yield 'INCOMPLETE'
                 except Exception:
                     page_ready=False
                     yield "QUERY_ERROR"
