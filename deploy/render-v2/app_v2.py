@@ -159,7 +159,7 @@ def summary():
     try:
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT d.code,e.shift,count(*) FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active GROUP BY d.code,e.shift ORDER BY d.code,e.shift")
+                cur.execute("SELECT d.name,e.shift,count(*) FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active GROUP BY d.code,e.shift ORDER BY d.code,e.shift")
                 roster=[{"department":d,"shift":s,"employees":n} for d,s,n in cur.fetchall()]
                 cur.execute("SELECT id,work_date,shift,status,missing_count,error_count,started_at FROM attendance_v2.attendance_runs ORDER BY started_at DESC LIMIT 20")
                 runs=[{"run_id":i,"work_date":str(w),"shift":s,"status":st,"missing_count":m,"error_count":e,"started_at":str(t)} for i,w,s,st,m,e,t in cur.fetchall()]
@@ -173,7 +173,7 @@ def missing():
     try:
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT r.id,r.work_date,r.shift,d.code,e.employee_no,e.full_name
+                cur.execute("""SELECT r.id,r.work_date,r.shift,d.name,e.employee_no,e.full_name
                   FROM attendance_v2.attendance_results a
                   JOIN attendance_v2.attendance_runs r ON r.id=a.run_id
                   JOIN attendance_v2.departments d ON d.id=r.department_id
@@ -401,7 +401,7 @@ def run_group():
         return jsonify(error="invalid_selection"),400
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e
+            cur.execute("""SELECT e.employee_no,e.full_name,d.name FROM attendance_v2.employees e
                 JOIN attendance_v2.departments d ON d.id=e.department_id
                 WHERE e.active AND (%s='ALL' OR d.code=%s) AND e.shift=%s
                 ORDER BY e.employee_no""",(dept,dept,shift))
@@ -531,7 +531,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
             if row is None:
                 return None
             run_id,s,day,total,trigger_type,key=row
-            cur.execute("""SELECT a.employee_no,e.full_name,d.code,a.status
+            cur.execute("""SELECT a.employee_no,e.full_name,d.name,a.status
                            FROM attendance_v2.attendance_results a
                            JOIN attendance_v2.employees e ON e.employee_no=a.employee_no
                            JOIN attendance_v2.departments d ON d.id=e.department_id
@@ -664,7 +664,7 @@ def scheduled_run():
             return jsonify(job_id=jid,status=j['status'],already_exists=True,shift=shift,work_date=work_date,invocation_id=invocation_id),200
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute('SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
+            cur.execute('SELECT e.employee_no,e.full_name,d.name FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
             roster=cur.fetchall()
     if not roster:
         return jsonify(error='empty_roster'),409
