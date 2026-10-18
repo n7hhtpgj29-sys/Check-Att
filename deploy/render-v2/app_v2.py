@@ -484,16 +484,29 @@ def scheduled_run():
     from datetime import date as _date
     import uuid
     from group_runner import launch,active_job,jobs
-    payload=request.get_json(silent=True) or {}
+    from datetime import timedelta
+    payload=request.get_json(silent=True)
+    if payload is None:
+        payload={}
+    if not isinstance(payload,dict):
+        return jsonify(error='invalid_json_body'),400
     shift=payload.get('shift')
     work_date=payload.get('work_date')
-    if shift not in ('D','N') or not isinstance(work_date,str):
-        return jsonify(error='shift_and_work_date_required'),400
+    now=datetime.now(BKK)
+    if shift is None and work_date is None:
+        # Make.com sends {} only. Resolve dates and shifts on the Thailand server.
+        # 00:00-04:59 belongs to the preceding night shift.
+        shift='N' if now.hour < 5 or now.hour >= 17 else 'D'
+        work_day=now.date()-timedelta(days=1) if now.hour < 5 else now.date()
+        work_date=work_day.isoformat()
+    elif shift not in ('D','N') or not isinstance(work_date,str):
+        return jsonify(error='shift_and_work_date_required',
+                       detail='Either omit both to use Bangkok time, or send shift D/N and YYYY-MM-DD work_date'),400
     try:
         day=_date.fromisoformat(work_date)
     except ValueError:
         return jsonify(error='invalid_work_date'),400
-    if abs((_date.today()-day).days)>7:
+    if abs((now.date()-day).days)>7:
         return jsonify(error='date_outside_allowed_range'),400
     try:
         completed=_db_no_scan_report(shift,work_date,scheduled_only=True)
