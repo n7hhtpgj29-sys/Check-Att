@@ -31,7 +31,13 @@ def home():
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
 <p><label>กะ <select id="test-shift"><option value="D">Today (D)</option><option value="N">Tonight (N)</option></select></label> <label>วันที่ <input id="work-date" type="date"></label></p>
 <p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="sendLine()">ส่ง LINE</button></p>
-<p><label>Upload employee CSV (EMP NO., NAME, DEPARTMENT, SHIFT)<br><input type="file" id="file" accept=".csv,text/csv"></label><br><button onclick="upload()">Import / update employees</button></p>
+<div style="border:1px solid #d5deef;border-radius:10px;padding:14px;margin:14px 0">
+<strong>นำเข้าทะเบียนพนักงาน / Employee Roster</strong><p style="margin:8px 0;font-size:13px">รองรับ CSV: Emp., Name, Dept, SHIFT (DS/NS หรือ D/N)</p>
+<input type="file" id="roster-file" accept=".csv,text/csv" style="width:100%;max-width:100%;box-sizing:border-box">
+<p style="font-size:14px"><label><input type="checkbox" id="replace-roster"> แทนที่ทะเบียนทั้งชุด (ปิดใช้งานพนักงานเดิมที่ไม่มีในไฟล์ใหม่)</label></p>
+<button type="button" id="roster-import-btn" onclick="uploadRoster()">ตรวจสอบและนำเข้ารายชื่อ</button>
+<pre id="import-feedback" role="status" aria-live="polite" style="min-height:28px">กรุณาเลือกไฟล์ CSV</pre>
+</div>
 <section id="run-panel" style="padding:16px;background:#eaf1fb;border-radius:10px;margin:12px 0"><strong id="run-status">Run status: idle</strong><div style="height:20px;background:#d2dbe9;border-radius:12px;overflow:hidden;margin-top:12px"><div id="run-bar" style="height:100%;width:0%;background:#2376d9;transition:width .4s"></div></div><p id="run-detail" style="margin:8px 0 0">0 / 0 (0%)</p></section><pre id="output">Enter V2_ADMIN_TOKEN to continue.</pre></main>
 <script>
 const out=document.getElementById('output');
@@ -92,7 +98,44 @@ async function loadMissing(){
   out.textContent=lines.join(String.fromCharCode(10));
  }catch(e){out.textContent='โหลดสรุปไม่สำเร็จ: '+e.message}
 }\nfunction sendLine(){if(!confirm('Send the latest completed no-scan list to the configured LINE recipient?'))return;display('/api/v2/send-line',{method:'POST'})}
-function upload(){const f=document.getElementById('file').files[0];if(!f){out.textContent='Choose CSV file';return}const form=new FormData();form.append('file',f);display('/api/v2/employees/import',{method:'POST',body:form})}
+async function uploadRoster(){
+ const fileInput=document.querySelector('#roster-file');
+ const status=document.querySelector('#import-feedback');
+ const button=document.querySelector('#roster-import-btn');
+ const file=fileInput && fileInput.files && fileInput.files.item(0);
+ if(!file){status.textContent='ยังไม่ได้เลือกไฟล์ CSV กรุณาเลือกไฟล์ก่อนนำเข้า';return}
+ if(!file.name.toLowerCase().endsWith('.csv')){status.textContent='รองรับไฟล์ CSV เท่านั้น';return}
+ const replace=document.querySelector('#replace-roster').checked;
+ const form=new FormData();form.append('file',file);form.append('replace_roster',replace?'1':'0');
+ button.disabled=true;
+ try{
+  status.textContent='กำลังตรวจสอบไฟล์ '+file.name+' ...';
+  const auth=headers();
+  const opts={method:'POST',headers:auth,body:form};
+  const previewRes=await fetch('/api/v2/employees/import?dry_run=1',opts);
+  const preview=await previewRes.json();
+  if(!previewRes.ok){status.textContent='ตรวจไฟล์ไม่ผ่าน ('+previewRes.status+'): '+(preview.message||preview.error||JSON.stringify(preview));return}
+  let details='ตรวจพบ '+preview.imported+' คน (D '+preview.shifts.D+', N '+preview.shifts.N+')'+
+   '\\nเพิ่มใหม่ '+preview.added+' | เปลี่ยนข้อมูล '+preview.changed+' | ใช้งานอยู่แล้ว '+preview.unchanged+
+   '\\nโหมด: '+(replace?'แทนที่ทะเบียนทั้งหมด (ปิดใช้งาน '+preview.deactivated+' คน)':'เพิ่ม/อัปเดตเท่านั้น ไม่ปิดคนเดิม')+
+   '\\nแผนก: '+Object.entries(preview.departments).map(([k,v])=>k+'='+v).join(', ');
+  status.textContent=details;
+  if(!confirm(details+'\\n\\nยืนยันนำเข้าทะเบียนนี้หรือไม่?')){status.textContent+='\\nยกเลิกการนำเข้า ยังไม่ได้แก้ไขฐานข้อมูล';return}
+  status.textContent='กำลังบันทึกข้อมูล '+file.name+' ...';
+  const res=await fetch('/api/v2/employees/import',{method:'POST',headers:auth,body:form});
+  const result=await res.json();
+  if(!res.ok){status.textContent='นำเข้าไม่สำเร็จ ('+res.status+'): '+(result.message||result.error||JSON.stringify(result));return}
+  status.textContent='นำเข้าสำเร็จ ✓ '+result.imported+' คน | เพิ่มใหม่ '+result.added+
+   ' | เปลี่ยนข้อมูล '+result.changed+' | ปิดคนที่ไม่มีในไฟล์ '+result.deactivated+
+   '\\nกะ D '+result.shifts.D+' คน / กะ N '+result.shifts.N+' คน'+
+   '\\nยอดพนักงาน Active หลังนำเข้า: '+result.active_total;
+ }catch(e){status.textContent='การเชื่อมต่อล้มเหลว: '+e.message}
+ finally{button.disabled=false}
+}
+document.querySelector('#roster-file').addEventListener('change',e=>{
+ const f=e.target.files && e.target.files.item(0);
+ document.querySelector('#import-feedback').textContent=f?'เลือกไฟล์ '+f.name+' ('+f.size+' bytes)':'กรุณาเลือกไฟล์ CSV';
+});
 document.getElementById('token').addEventListener('change',()=>progress());\nconst bangkok=new Date(Date.now()+7*3600000);if(bangkok.getUTCHours()<5)bangkok.setUTCDate(bangkok.getUTCDate()-1);document.getElementById('work-date').value=bangkok.toISOString().slice(0,10);\n</script></html>"""
 
 @app.get("/api/v2/health")
