@@ -547,6 +547,13 @@ def _ensure_delivery_claims(cur):
             sent_at timestamptz
         )
     """)
+    # The user confirmed the D shift of 2026-10-18 already reached LINE twice
+    # before atomic claims were introduced. Block a third send for this slot.
+    cur.execute("""
+        INSERT INTO attendance_v2.line_delivery_claims(job_key,shift,work_date,state)
+        VALUES ('V2:ALL:D:2026-10-18','D','2026-10-18','sent')
+        ON CONFLICT (job_key) DO NOTHING
+    """)
 
 
 @app.post("/api/v2/line-delivery-claim")
