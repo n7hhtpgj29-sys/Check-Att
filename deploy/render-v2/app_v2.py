@@ -532,3 +532,105 @@ def scheduled_run():
     if not launch(jid,ids,shift,work_date,'ALL',names,depts,trigger_type='scheduled'):
         return jsonify(error='another_run_active',active=active_job()),409
     return jsonify(job_id=jid,status='running',total=len(ids),shift=shift,work_date=work_date),202
+
+
+def _ensure_delivery_claims(cur):
+    """Private V2-only, durable LINE idempotency table."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS attendance_v2.line_delivery_claims (
+            job_key text PRIMARY KEY,
+            shift text NOT NULL CHECK (shift IN ('D','N')),
+            work_date date NOT NULL,
+            state text NOT NULL DEFAULT 'claimed'
+                CHECK (state IN ('claimed','sent')),
+            claimed_at timestamptz NOT NULL DEFAULT now(),
+            sent_at timestamptz
+        )
+    """)
+
+
+@app.post("/api/v2/line-delivery-claim")
+@secure
+def line_delivery_claim():
+    """Claim exactly one LINE send per completed scheduled shift/day.
+
+    A claimed-but-unsent job is NOT automatically retried: avoids double sending
+    if LINE accepts the request but Make crashes before its acknowledgement.
+    """
+    data=request.get_json(silent=True) or {}
+    if not isinstance(data,dict):
+        return jsonify(error="invalid_json"),400
+    shift=data.get("shift")
+    work_date=data.get("work_date")
+    job_id=data.get("job_id")
+    if shift not in ("D","N") or not isinstance(work_date,str):
+        return jsonify(error="shift_and_work_date_required"),400
+    try:
+        from datetime import date as _date
+        day=_date.fromisoformat(work_date)
+    except ValueError:
+        return jsonify(error="invalid_work_date"),400
+    if abs((datetime.now(BKK).date()-day).days)>1:
+        return jsonify(error="date_outside_allowed_range"),400
+    expected="V2:ALL:"+shift+":"+work_date
+    if job_id is not None and job_id!=expected:
+        return jsonify(error="job_id_mismatch",claimed=False),400
+    try:
+        report=_db_no_scan_report(shift,work_date,scheduled_only=True)
+        if report is None:
+            return jsonify(ready=False,claimed=False,reason="not_ready"),200
+        if report["job_id"]!=expected or report["status"]!="completed" or report["department"]!="ALL":
+            return jsonify(ready=False,claimed=False,reason="report_mismatch"),200
+        if report["query_errors"] or report["unverified"] or report["total"] <= 0 or (
+            report["scanned"]+report["no_scan"] != report["total"]
+        ):
+            return jsonify(ready=False,claimed=False,reason="incomplete_report"),200
+        message=_format_no_scan_message(report)
+        if len(message)>4800:
+            return jsonify(ready=False,claimed=False,reason="line_message_too_long"),200
+        with connect() as conn:
+            with conn.cursor() as cur:
+                _ensure_delivery_claims(cur)
+                cur.execute("""
+                    INSERT INTO attendance_v2.line_delivery_claims(job_key,shift,work_date)
+                    VALUES (%s,%s,%s)
+                    ON CONFLICT (job_key) DO NOTHING
+                    RETURNING job_key
+                """,(expected,shift,work_date))
+                claimed=cur.fetchone() is not None
+        if not claimed:
+            return jsonify(ready=True,claimed=False,already_claimed=True,job_id=expected),200
+        return jsonify(ready=True,claimed=True,job_id=expected,
+                       line_message=message,shift=shift,work_date=work_date,
+                       total=report["total"],no_scan=report["no_scan"]),200
+    except Exception:
+        app.logger.exception("V2 LINE delivery claim failure")
+        return jsonify(error="claim_database_unavailable"),503
+
+
+@app.post("/api/v2/line-delivery-ack")
+@secure
+def line_delivery_ack():
+    """Record a confirmed successful LINE response; does not unlock the claim."""
+    data=request.get_json(silent=True) or {}
+    if not isinstance(data,dict):
+        return jsonify(error="invalid_json"),400
+    job_id=data.get("job_id")
+    if not isinstance(job_id,str) or not re.fullmatch(r"V2:ALL:[DN]:\d{4}-\d{2}-\d{2}",job_id):
+        return jsonify(error="invalid_job_id"),400
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                _ensure_delivery_claims(cur)
+                cur.execute("""
+                    UPDATE attendance_v2.line_delivery_claims
+                    SET state='sent',sent_at=COALESCE(sent_at,now())
+                    WHERE job_key=%s RETURNING job_key
+                """,(job_id,))
+                found=cur.fetchone() is not None
+        if not found:
+            return jsonify(error="claim_not_found"),404
+        return jsonify(acknowledged=True,job_id=job_id),200
+    except Exception:
+        app.logger.exception("V2 LINE acknowledgement failure")
+        return jsonify(error="ack_database_unavailable"),503
