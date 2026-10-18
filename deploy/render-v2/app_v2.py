@@ -188,45 +188,142 @@ def missing():
 @app.post("/api/v2/employees/import")
 @secure
 def import_employees():
-    file=request.files.get("file")
-    if not file or not file.filename.lower().endswith(".csv"):
-        return jsonify(error="csv_file_required"),400
+    """Preview and import complete CSV rosters, without silently deleting employees."""
+    from collections import Counter
+    from group_runner import active_job
+
+    source=request.files.get("file")
+    if source is None or not source.filename or not source.filename.lower().endswith(".csv"):
+        return jsonify(error="csv_file_required",
+                       message="กรุณาเลือกไฟล์ CSV ก่อนกดนำเข้า"),400
+
     try:
-        raw=file.read().decode("utf-8-sig")
-        reader=csv.DictReader(io.StringIO(raw))
-        if not reader.fieldnames: raise ValueError("Missing header")
-        aliases={"EMP NO.":"employee_no","EMP NO":"employee_no","EMPLOYEE_NO":"employee_no","NAME":"full_name","FULL_NAME":"full_name","DEPARTMENT":"department","DEPT":"department","SHIFT":"shift"}
-        columns={k:aliases.get(k.strip().upper()) for k in reader.fieldnames}
-        if not {"employee_no","full_name","department","shift"}.issubset(set(columns.values())):
-            return jsonify(error="required_columns",expected=["EMP NO.","NAME","DEPARTMENT","SHIFT"]),400
-        entries={}
-        for idx,record in enumerate(reader,2):
-            normalized={columns[k]:(v or "").strip() for k,v in record.items() if k in columns and columns[k]}
-            no=normalized["employee_no"].upper();name=normalized["full_name"];dept=normalized["department"].upper();shift=normalized["shift"].upper()
-            if not re.fullmatch(r"[A-Z0-9-]{2,24}",no) or not name or len(name)>160 or not re.fullmatch(r"[A-Z0-9_-]{1,24}",dept) or shift not in ("D","N"):
-                return jsonify(error="invalid_row",row=idx),400
-            if no in entries: return jsonify(error="duplicate_employee_no",row=idx),400
-            entries[no]=(name,dept,shift)
-            if len(entries)>5000:return jsonify(error="too_many_rows"),400
-        if not entries:return jsonify(error="empty_roster"),400
+        text=source.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return jsonify(error="csv_must_be_utf8",
+                       message="ไฟล์ต้องบันทึกเป็น CSV UTF-8"),400
+
+    reader=csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        return jsonify(error="missing_csv_headers"),400
+    aliases={
+        "EMP.":"employee_no","EMP":"employee_no","EMP NO.":"employee_no",
+        "EMP NO":"employee_no","EMPLOYEE_NO":"employee_no",
+        "EMPLOYEE ID":"employee_no","NAME":"full_name","FULL_NAME":"full_name",
+        "DEPARTMENT":"department","DEPT":"department","SHIFT":"shift"
+    }
+    columns={key:aliases.get((key or "").strip().upper()) for key in reader.fieldnames}
+    if not {"employee_no","full_name","department","shift"}.issubset(set(columns.values())):
+        return jsonify(error="required_columns",
+                       message="หัวตารางไม่ตรง กรุณาใช้ Emp., Name, Dept, SHIFT",
+                       found=reader.fieldnames,
+                       accepted=["Emp.","Name","Dept","SHIFT"]),400
+
+    entries={}
+    labels={}
+    for lineno,record in enumerate(reader,2):
+        data={columns[key]:(value or "").strip() for key,value in record.items()
+              if key is not None and columns.get(key)}
+        number=data.get("employee_no","").upper()
+        name=data.get("full_name","").strip()
+        display_dept=data.get("department","").upper()
+        # Preserve "ME/EE" in the department display name, while using a
+        # constraint-safe code "ME-EE" in attendance_v2.departments.code.
+        dept_code=display_dept.replace("/","-")
+        raw_shift=data.get("shift","").upper()
+        shift={"DS":"D","NS":"N","D":"D","N":"N"}.get(raw_shift)
+        if (not re.fullmatch(r"[A-Z0-9-]{2,24}",number) or not name or
+            len(name)>160 or not re.fullmatch(r"[A-Z0-9_/-]{1,24}",display_dept) or
+            not re.fullmatch(r"[A-Z0-9_-]{1,24}",dept_code) or shift is None):
+            return jsonify(error="invalid_row",row=lineno,
+                           message="ข้อมูลรหัสพนักงาน ชื่อ แผนก หรือกะไม่ถูกต้อง",
+                           employee_no=number),400
+        if number in entries:
+            return jsonify(error="duplicate_employee_no",row=lineno,
+                           employee_no=number),400
+        if dept_code in labels and labels[dept_code]!=display_dept:
+            return jsonify(error="department_code_conflict",row=lineno),400
+        labels[dept_code]=display_dept
+        entries[number]=(name,dept_code,shift)
+        if len(entries)>5000:
+            return jsonify(error="too_many_rows"),400
+
+    if not entries:
+        return jsonify(error="empty_roster"),400
+
+    dry_run=request.args.get("dry_run")=="1"
+    replace_roster=request.form.get("replace_roster")=="1"
+    if not dry_run and active_job() is not None:
+        return jsonify(error="attendance_run_in_progress",
+                       message="กำลังตรวจพนักงานอยู่ กรุณานำเข้าหลังตรวจเสร็จ"),409
+
+    try:
         with connect() as conn:
             with conn.cursor() as cur:
-                for dept in sorted({v[1] for v in entries.values()}):
-                    cur.execute("INSERT INTO attendance_v2.departments(code,name) VALUES(%s,%s) ON CONFLICT(code) DO NOTHING",(dept,dept))
-                    for shift,run_time in (("D","08:15"),("N","20:15")):
-                        cur.execute("""INSERT INTO attendance_v2.schedule_settings(department_id,shift,enabled,run_time)
-                        SELECT id,%s,false,%s FROM attendance_v2.departments WHERE code=%s
-                        ON CONFLICT(department_id,shift) DO NOTHING""",(shift,run_time,dept))
-                for no,(name,dept,shift) in entries.items():
-                    cur.execute("""INSERT INTO attendance_v2.employees(employee_no,full_name,department_id,shift,active)
-                    VALUES(%s,%s,(SELECT id FROM attendance_v2.departments WHERE code=%s),%s,true)
-                    ON CONFLICT(employee_no) DO UPDATE SET full_name=excluded.full_name,
-                    department_id=excluded.department_id,shift=excluded.shift,active=true,updated_at=now()""",(no,name,dept,shift))
-        return jsonify(imported=len(entries),note="Upsert only; employees not in CSV are unchanged. Scheduling stays disabled.")
-    except UnicodeDecodeError:
-        return jsonify(error="csv_must_be_utf8"),400
+                cur.execute("""SELECT e.employee_no,e.full_name,d.code,e.shift,e.active
+                               FROM attendance_v2.employees e
+                               JOIN attendance_v2.departments d ON d.id=e.department_id""")
+                existing={no:(name,dept,shift,active)
+                          for no,name,dept,shift,active in cur.fetchall()}
+                currently_active={no for no,values in existing.items() if values[3]}
+                added=sum(no not in existing for no in entries)
+                changed=sum(no in existing and (
+                    existing[no][0]!=v[0] or existing[no][1]!=v[1] or
+                    existing[no][2]!=v[2] or not existing[no][3]
+                ) for no,v in entries.items())
+                unchanged=len(entries)-added-changed
+                deactivated=(len(currently_active-set(entries)) if replace_roster else 0)
+                active_total=(len(entries) if replace_roster else
+                              len(currently_active|set(entries)))
+                shifts=dict(Counter(v[2] for v in entries.values()))
+                shifts={"D":shifts.get("D",0),"N":shifts.get("N",0)}
+                departments=dict(sorted(Counter(labels[v[1]] for v in entries.values()).items()))
+                summary={"imported":len(entries),"added":added,
+                         "changed":changed,"unchanged":unchanged,
+                         "deactivated":deactivated,
+                         "active_total":active_total,
+                         "replace_roster":replace_roster,
+                         "departments":departments,"shifts":shifts}
+                if dry_run:
+                    return jsonify(preview=True,**summary)
+
+                for code,label in sorted(labels.items()):
+                    cur.execute("""INSERT INTO attendance_v2.departments(code,name)
+                                   VALUES(%s,%s)
+                                   ON CONFLICT(code) DO UPDATE SET name=excluded.name""",
+                                (code,label))
+                    for shift_name,run_time in (("D","08:15"),("N","20:15")):
+                        cur.execute("""INSERT INTO attendance_v2.schedule_settings(
+                                         department_id,shift,enabled,run_time)
+                                       SELECT id,%s,false,%s FROM attendance_v2.departments
+                                       WHERE code=%s
+                                       ON CONFLICT(department_id,shift) DO NOTHING""",
+                                    (shift_name,run_time,code))
+
+                for no,(name,code,shift_name) in entries.items():
+                    cur.execute("""INSERT INTO attendance_v2.employees(
+                                      employee_no,full_name,department_id,shift,active)
+                                   VALUES(%s,%s,
+                                      (SELECT id FROM attendance_v2.departments WHERE code=%s),
+                                      %s,true)
+                                   ON CONFLICT(employee_no) DO UPDATE SET
+                                      full_name=excluded.full_name,
+                                      department_id=excluded.department_id,
+                                      shift=excluded.shift,active=true,updated_at=now()""",
+                                (no,name,code,shift_name))
+                if replace_roster:
+                    cur.execute("""UPDATE attendance_v2.employees
+                                   SET active=false,updated_at=now()
+                                   WHERE active=true AND NOT (employee_no = ANY(%s))""",
+                                (list(entries),))
+                cur.execute("SELECT count(*) FROM attendance_v2.employees WHERE active=true")
+                summary["active_total"]=cur.fetchone()[0]
+                return jsonify(success=True,**summary)
     except Exception:
-        return jsonify(error="import_failed"),503
+        app.logger.exception("V2 employee roster import failed")
+        return jsonify(error="import_failed",
+                       message="ไม่สามารถบันทึกข้อมูลได้ กรุณาตรวจสอบ Server log"),503
+
 
 @app.post("/api/v2/source-probe")
 @secure
