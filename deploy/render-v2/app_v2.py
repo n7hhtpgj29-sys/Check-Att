@@ -506,7 +506,7 @@ def _format_no_scan_message(report):
     return "\n".join(lines)
 
 
-def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
+def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key=None):
     """Read a completed, durable ALL-department result; never return partial runs."""
     from collections import Counter
     conditions=["r.status='completed'","d.code='ALL'"]
@@ -519,6 +519,9 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
         args.append(work_date)
     if scheduled_only:
         conditions.append("r.trigger_type='scheduled'")
+    if run_key:
+        conditions.append("r.scheduled_key=%s")
+        args.append(run_key)
     query="""SELECT r.id,r.shift,r.work_date,r.total_employees,
                     r.trigger_type,r.scheduled_key
              FROM attendance_v2.attendance_runs r
@@ -531,7 +534,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
             if row is None:
                 return None
             run_id,s,day,total,trigger_type,key=row
-            cur.execute("""SELECT a.employee_no,e.full_name,d.name,a.status
+            cur.execute("""SELECT a.employee_no,e.full_name,d.name,a.status,a.detail
                            FROM attendance_v2.attendance_results a
                            JOIN attendance_v2.employees e ON e.employee_no=a.employee_no
                            JOIN attendance_v2.departments d ON d.id=e.department_id
@@ -540,8 +543,18 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False):
     if len(rows)!=total or total==0:
         return None
     counts=Counter(r[3] for r in rows)
-    missing=[{"employee_no":r[0],"name":r[1],"department":r[2]}
-             for r in rows if r[3]=="NO_SCAN_IN_WINDOW"]
+    import json
+    missing=[]
+    for r in rows:
+        if r[3]!="NO_SCAN_IN_WINDOW":
+            continue
+        try:
+            snapshot=json.loads(r[4]) if r[4] else {}
+        except (TypeError,ValueError):
+            snapshot={}
+        missing.append({"employee_no":r[0],
+                        "name":snapshot.get("name",r[1]),
+                        "department":snapshot.get("department",r[2])})
     department_counts=dict(sorted(Counter(r["department"] for r in missing).items()))
     return {"department_counts":department_counts,
             "job_id":key or "V2:DB:"+str(run_id),
@@ -648,20 +661,14 @@ def scheduled_run():
         return jsonify(error='invalid_work_date'),400
     if abs((now.date()-day).days)>7:
         return jsonify(error='date_outside_allowed_range'),400
-    # A fresh ID represents exactly one invocation of Make Run once or the scheduler.
-    # An existing completed scan can be reported again on a separate invocation.
+    # Every Make execution starts a new scan against the ACTIVE roster.
+    # Previously completed results must never be reused after a roster import.
+    current=active_job()
+    if current:
+        return jsonify(error='another_run_active',job_id=current.get('job_id'),
+                       status=current.get('status')),409
     invocation_id=str(uuid.uuid4())
-    try:
-        completed=_db_no_scan_report(shift,work_date,scheduled_only=True)
-    except Exception:
-        app.logger.exception("Failed to check previously completed schedule")
-        return jsonify(error="schedule_database_unavailable"),503
-    if completed:
-        return jsonify(job_id=completed["job_id"],status="completed",already_exists=True,
-                       total=completed["total"],shift=shift,work_date=work_date,invocation_id=invocation_id),200
-    for jid,j in reversed(list(jobs.items())):
-        if j.get('trigger_type')=='scheduled' and j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
-            return jsonify(job_id=jid,status=j['status'],already_exists=True,shift=shift,work_date=work_date,invocation_id=invocation_id),200
+    scheduled_key='V2:ALL:'+shift+':'+work_date+':'+invocation_id
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute('SELECT e.employee_no,e.full_name,d.name FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
@@ -672,9 +679,11 @@ def scheduled_run():
     names={r[0]:r[1] for r in roster}
     depts={r[0]:r[2] for r in roster}
     jid=str(uuid.uuid4())
-    if not launch(jid,ids,shift,work_date,'ALL',names,depts,trigger_type='scheduled'):
+    if not launch(jid,ids,shift,work_date,'ALL',names,depts,
+                  trigger_type='scheduled',scheduled_key=scheduled_key):
         return jsonify(error='another_run_active',active=active_job()),409
-    return jsonify(job_id=jid,status='running',total=len(ids),shift=shift,work_date=work_date,invocation_id=invocation_id),202
+    return jsonify(job_id=scheduled_key,status='running',total=len(ids),shift=shift,
+                   work_date=work_date,invocation_id=invocation_id),202
 
 
 def _ensure_delivery_claims(cur):
