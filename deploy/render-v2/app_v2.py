@@ -508,6 +508,9 @@ def scheduled_run():
         return jsonify(error='invalid_work_date'),400
     if abs((now.date()-day).days)>7:
         return jsonify(error='date_outside_allowed_range'),400
+    # A fresh ID represents exactly one invocation of Make Run once or the scheduler.
+    # An existing completed scan can be reported again on a separate invocation.
+    invocation_id=str(uuid.uuid4())
     try:
         completed=_db_no_scan_report(shift,work_date,scheduled_only=True)
     except Exception:
@@ -515,10 +518,10 @@ def scheduled_run():
         return jsonify(error="schedule_database_unavailable"),503
     if completed:
         return jsonify(job_id=completed["job_id"],status="completed",already_exists=True,
-                       total=completed["total"],shift=shift,work_date=work_date),200
+                       total=completed["total"],shift=shift,work_date=work_date,invocation_id=invocation_id),200
     for jid,j in reversed(list(jobs.items())):
         if j.get('trigger_type')=='scheduled' and j.get('department')=='ALL' and j.get('shift')==shift and j.get('work_date')==work_date and j.get('status') in ('running','completed'):
-            return jsonify(job_id=jid,status=j['status'],already_exists=True,shift=shift,work_date=work_date),200
+            return jsonify(job_id=jid,status=j['status'],already_exists=True,shift=shift,work_date=work_date,invocation_id=invocation_id),200
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute('SELECT e.employee_no,e.full_name,d.code FROM attendance_v2.employees e JOIN attendance_v2.departments d ON d.id=e.department_id WHERE e.active AND e.shift=%s ORDER BY e.employee_no',(shift,))
@@ -531,7 +534,7 @@ def scheduled_run():
     jid=str(uuid.uuid4())
     if not launch(jid,ids,shift,work_date,'ALL',names,depts,trigger_type='scheduled'):
         return jsonify(error='another_run_active',active=active_job()),409
-    return jsonify(job_id=jid,status='running',total=len(ids),shift=shift,work_date=work_date),202
+    return jsonify(job_id=jid,status='running',total=len(ids),shift=shift,work_date=work_date,invocation_id=invocation_id),202
 
 
 def _ensure_delivery_claims(cur):
@@ -547,22 +550,15 @@ def _ensure_delivery_claims(cur):
             sent_at timestamptz
         )
     """)
-    # The user confirmed the D shift of 2026-10-18 already reached LINE twice
-    # before atomic claims were introduced. Block a third send for this slot.
-    cur.execute("""
-        INSERT INTO attendance_v2.line_delivery_claims(job_key,shift,work_date,state)
-        VALUES ('V2:ALL:D:2026-10-18','D','2026-10-18','sent')
-        ON CONFLICT (job_key) DO NOTHING
-    """)
 
 
 @app.post("/api/v2/line-delivery-claim")
 @secure
 def line_delivery_claim():
-    """Claim exactly one LINE send per completed scheduled shift/day.
+    """Acquire one sending permission per Make execution, not per day.
 
-    A claimed-but-unsent job is NOT automatically retried: avoids double sending
-    if LINE accepts the request but Make crashes before its acknowledgement.
+    Repeated poll bundles within one Run once share invocation_id and cannot
+    generate duplicate LINE sends. A second Run once gets a new invocation_id.
     """
     data=request.get_json(silent=True) or {}
     if not isinstance(data,dict):
@@ -570,6 +566,13 @@ def line_delivery_claim():
     shift=data.get("shift")
     work_date=data.get("work_date")
     job_id=data.get("job_id")
+    invocation_id=data.get("invocation_id")
+    import uuid
+    try:
+        if not isinstance(invocation_id,str) or str(uuid.UUID(invocation_id))!=invocation_id:
+            raise ValueError("missing or invalid invocation ID")
+    except ValueError:
+        return jsonify(error="valid_invocation_id_required"),400
     if shift not in ("D","N") or not isinstance(work_date,str):
         return jsonify(error="shift_and_work_date_required"),400
     try:
@@ -580,6 +583,7 @@ def line_delivery_claim():
     if abs((datetime.now(BKK).date()-day).days)>1:
         return jsonify(error="date_outside_allowed_range"),400
     expected="V2:ALL:"+shift+":"+work_date
+    claim_key="V2:RUN:"+invocation_id
     if job_id is not None and job_id!=expected:
         return jsonify(error="job_id_mismatch",claimed=False),400
     try:
@@ -603,12 +607,12 @@ def line_delivery_claim():
                     VALUES (%s,%s,%s)
                     ON CONFLICT (job_key) DO NOTHING
                     RETURNING job_key
-                """,(expected,shift,work_date))
+                """,(claim_key,shift,work_date))
                 claimed=cur.fetchone() is not None
         if not claimed:
-            return jsonify(ready=True,claimed=False,already_claimed=True,job_id=expected),200
+            return jsonify(ready=True,claimed=False,already_claimed=True,job_id=expected,invocation_id=invocation_id),200
         return jsonify(ready=True,claimed=True,job_id=expected,
-                       line_message=message,shift=shift,work_date=work_date,
+                       invocation_id=invocation_id,line_message=message,shift=shift,work_date=work_date,
                        total=report["total"],no_scan=report["no_scan"]),200
     except Exception:
         app.logger.exception("V2 LINE delivery claim failure")
@@ -622,9 +626,14 @@ def line_delivery_ack():
     data=request.get_json(silent=True) or {}
     if not isinstance(data,dict):
         return jsonify(error="invalid_json"),400
-    job_id=data.get("job_id")
-    if not isinstance(job_id,str) or not re.fullmatch(r"V2:ALL:[DN]:\d{4}-\d{2}-\d{2}",job_id):
-        return jsonify(error="invalid_job_id"),400
+    invocation_id=data.get("invocation_id")
+    import uuid
+    try:
+        if not isinstance(invocation_id,str) or str(uuid.UUID(invocation_id))!=invocation_id:
+            raise ValueError("missing or invalid invocation ID")
+    except ValueError:
+        return jsonify(error="valid_invocation_id_required"),400
+    claim_key="V2:RUN:"+invocation_id
     try:
         with connect() as conn:
             with conn.cursor() as cur:
@@ -633,11 +642,11 @@ def line_delivery_ack():
                     UPDATE attendance_v2.line_delivery_claims
                     SET state='sent',sent_at=COALESCE(sent_at,now())
                     WHERE job_key=%s RETURNING job_key
-                """,(job_id,))
+                """,(claim_key,))
                 found=cur.fetchone() is not None
         if not found:
             return jsonify(error="claim_not_found"),404
-        return jsonify(acknowledged=True,job_id=job_id),200
+        return jsonify(acknowledged=True,invocation_id=invocation_id),200
     except Exception:
         app.logger.exception("V2 LINE acknowledgement failure")
         return jsonify(error="ack_database_unavailable"),503
