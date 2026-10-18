@@ -731,12 +731,15 @@ def line_delivery_claim():
         return jsonify(error="invalid_work_date"),400
     if abs((datetime.now(BKK).date()-day).days)>1:
         return jsonify(error="date_outside_allowed_range"),400
-    expected="V2:ALL:"+shift+":"+work_date
+    legacy="V2:ALL:"+shift+":"+work_date
+    expected=legacy+":"+invocation_id
     claim_key="V2:RUN:"+invocation_id
-    if job_id is not None and job_id!=expected:
+    # Legacy Make v6 constructs the day-level key; accept it only alongside
+    # the valid invocation ID while reading exclusively that run's snapshot.
+    if job_id is not None and job_id not in (legacy,expected):
         return jsonify(error="job_id_mismatch",claimed=False),400
     try:
-        report=_db_no_scan_report(shift,work_date,scheduled_only=True)
+        report=_db_no_scan_report(shift,work_date,scheduled_only=True,run_key=expected)
         if report is None:
             return jsonify(ready=False,claimed=False,reason="not_ready"),200
         if report["job_id"]!=expected or report["status"]!="completed" or report["department"]!="ALL":
@@ -828,8 +831,9 @@ def line_delivery_wait():
         return jsonify(error="invalid_work_date_or_invocation"),400
     if abs((datetime.now(BKK).date()-day).days)>1:
         return jsonify(error="date_outside_allowed_range"),400
-    expected="V2:ALL:"+shift+":"+work_date
-    if data.get("job_id")!=expected:
+    legacy="V2:ALL:"+shift+":"+work_date
+    expected=legacy+":"+invocation_id
+    if data.get("job_id") not in (legacy,expected):
         return jsonify(error="job_id_mismatch"),400
     try:
         max_wait=int(data.get("wait_seconds",260))
@@ -844,7 +848,7 @@ def line_delivery_wait():
         current=[j for j in list(jobs.values()) if
                  j.get("trigger_type")=="scheduled" and
                  j.get("department")=="ALL" and
-                 j.get("shift")==shift and j.get("work_date")==work_date]
+                 j.get("scheduled_key")==expected]
         if current and current[-1].get("status")=="failed":
             return jsonify(ready=False,claimed=False,reason="collector_failed"),200
         if not current or current[-1].get("status")!="running":
