@@ -3,6 +3,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from fast_collector import scan_group
 import os
+import json
 import psycopg
 
 lock = Lock()
@@ -16,7 +17,9 @@ def persist_completed_job(job_id):
     if job["department"] != "ALL" or job["done"] != job["total"]:
         return False
     scheduled = job.get("trigger_type") == "scheduled"
-    key = "V2:ALL:%s:%s" % (job["shift"], job["work_date"]) if scheduled else None
+    key = job.get("scheduled_key") if scheduled else None
+    if scheduled and not key:
+        raise ValueError("scheduled_key_required")
     with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=8, options="-c statement_timeout=30000") as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO attendance_v2.departments(code,name) VALUES('ALL','All departments') ON CONFLICT(code) DO NOTHING")
@@ -35,20 +38,20 @@ def persist_completed_job(job_id):
             run_id=cur.fetchone()[0]
             cur.execute("DELETE FROM attendance_v2.attendance_results WHERE run_id=%s",(run_id,))
             cur.executemany("""INSERT INTO attendance_v2.attendance_results
-                (run_id,employee_no,status) VALUES(%s,%s,%s)""",
-                [(run_id,r["employee_no"],r["status"]) for r in job["results"]])
+                (run_id,employee_no,status,detail) VALUES(%s,%s,%s,%s)""",
+                [(run_id,r["employee_no"],r["status"],json.dumps({"name":r["name"],"department":r["department"]},ensure_ascii=False)) for r in job["results"]])
     return True
 
 
 def launch(job_id, employees, shift, work_date, department, employee_names,
-           employee_departments=None, trigger_type="manual"):
+           employee_departments=None, trigger_type="manual", scheduled_key=None):
     global active_job_id
     if not lock.acquire(blocking=False):
         return False
     active_job_id=job_id
     jobs[job_id]={"status":"running","total":len(employees),"done":0,"counts":{},
                   "shift":shift,"department":department,"work_date":work_date,
-                  "trigger_type":trigger_type,"results":[],
+                  "trigger_type":trigger_type,"scheduled_key":scheduled_key,"results":[],
                   "started_at":datetime.now(timezone.utc).isoformat()}
     def worker():
         counts=Counter()
