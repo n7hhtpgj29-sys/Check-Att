@@ -650,3 +650,63 @@ def line_delivery_ack():
     except Exception:
         app.logger.exception("V2 LINE acknowledgement failure")
         return jsonify(error="ack_database_unavailable"),503
+
+
+@app.post("/api/v2/line-delivery-wait")
+@secure
+def line_delivery_wait():
+    """Single blocking status check for one Make execution.
+
+    Poll on Render instead of expanding Make repeater branches. Only attempt
+    a DB claim when the completed report is valid; Make sends just once.
+    """
+    import time
+    import uuid
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict):
+        return jsonify(error="json_body_required"),400
+    shift=data.get("shift")
+    work_date=data.get("work_date")
+    invocation_id=data.get("invocation_id")
+    if shift not in ("D","N") or not isinstance(work_date,str):
+        return jsonify(error="shift_and_work_date_required"),400
+    try:
+        from datetime import date as _date
+        day=_date.fromisoformat(work_date)
+        if not isinstance(invocation_id,str) or str(uuid.UUID(invocation_id))!=invocation_id:
+            raise ValueError("invalid invocation ID")
+    except ValueError:
+        return jsonify(error="invalid_work_date_or_invocation"),400
+    if abs((datetime.now(BKK).date()-day).days)>1:
+        return jsonify(error="date_outside_allowed_range"),400
+    expected="V2:ALL:"+shift+":"+work_date
+    if data.get("job_id")!=expected:
+        return jsonify(error="job_id_mismatch"),400
+    try:
+        max_wait=int(data.get("wait_seconds",260))
+    except (TypeError,ValueError):
+        return jsonify(error="invalid_wait_seconds"),400
+    if max_wait<0 or max_wait>265:
+        return jsonify(error="wait_seconds_out_of_range"),400
+    deadline=time.monotonic()+max_wait
+    while True:
+        # Skip expensive database queries while the in-memory collector is running.
+        from group_runner import jobs
+        current=[j for j in list(jobs.values()) if
+                 j.get("trigger_type")=="scheduled" and
+                 j.get("department")=="ALL" and
+                 j.get("shift")==shift and j.get("work_date")==work_date]
+        if current and current[-1].get("status")=="failed":
+            return jsonify(ready=False,claimed=False,reason="collector_failed"),200
+        if not current or current[-1].get("status")!="running":
+            response=line_delivery_claim.__wrapped__()
+            body=(response[0] if isinstance(response,tuple) else response).get_json(silent=True) or {}
+            if body.get("claimed") or body.get("already_claimed") or body.get("error"):
+                return response
+            if body.get("reason")!="not_ready":
+                return response
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            return jsonify(ready=False,claimed=False,reason="wait_timeout",
+                           shift=shift,work_date=work_date),200
+        time.sleep(min(4,remaining))
