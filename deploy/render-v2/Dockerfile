@@ -10,4 +10,4 @@ ENV PLAYWRIGHT_HEADLESS=0
 ENV TZ=Asia/Bangkok
 ENV PORT=10000
 EXPOSE 10000
-CMD ["sh","-c","xvfb-run -a gunicorn --workers 1 --timeout 90 --bind 0.0.0.0:${PORT:-10000} app_v2:app"]
+CMD ["sh","-c","xvfb-run -a gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 360 --bind 0.0.0.0:${PORT:-10000} app_v2:app"]
