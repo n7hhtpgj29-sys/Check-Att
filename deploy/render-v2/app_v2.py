@@ -769,9 +769,9 @@ def send_line():
     for dept,count in report['department_counts'].items():
         lines.append(f'[{dept}] — {count} คน')
         lines += ['• '+r['employee_no']+' - '+r['name'] for r in report['employees'] if r['department']==dept]
+    lines.append("No scan is not confirmed absence; check leave records.")
     lines.append("")
     lines.append("ข้อมูลล่าสุด query เมื่อ : "+_format_query_completed_at(report.get("last_query_at")))
-    lines.append("No scan is not confirmed absence; check leave records.")
     message="\n".join(lines)
     if len(message)>4800:
         return jsonify(error="line_message_too_long"),409
