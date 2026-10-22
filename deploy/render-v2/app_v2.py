@@ -51,7 +51,15 @@ function showJob(j){
  const done=j.done||0,total=j.total||0;
  const pct=total?Math.round(done*100/total):0;
  document.getElementById('run-status').textContent='Run: '+(j.status||'unknown');\n document.getElementById('run-bar').style.width=pct+'%';\n document.getElementById('run-detail').textContent=done+' / '+total+' ('+pct+'%) | '+JSON.stringify(j.counts||{});
- out.textContent=JSON.stringify(j,null,2);
+ if(j.status==='completed' && j.roster_matches_current===false){
+  document.getElementById('run-status').textContent='ผลตรวจเก่า — ไม่ตรงทะเบียนล่าสุด';
+  document.getElementById('run-detail').textContent='เคยตรวจ '+total+' คน / Active ปัจจุบัน '+j.active_shift_count+' คน — กรุณากดตรวจใหม่';
+  out.textContent='ผลตรวจเดิมไม่สามารถใช้สรุป No Scan ปัจจุบันได้'+
+   '\\nรหัสที่อยู่ในผลเดิม แต่ไม่อยู่ในกะ Active: '+(j.no_longer_in_shift||[]).join(', ')+
+   '\\nรหัส Active ที่ยังไม่ได้ตรวจในรอบเดิม: '+(j.not_checked_from_active_roster||[]).join(', ');
+ }else{
+  out.textContent=JSON.stringify(j,null,2);
+ }
  if(j.status==='running'&&!pollTimer)pollTimer=setInterval(progress,5000);
  if(j.status!=='running'&&pollTimer){clearInterval(pollTimer);pollTimer=null}
 }
