@@ -430,6 +430,10 @@ def group_progress(job_id):
     from group_runner import jobs
     job=jobs.get(job_id)
     if job is None:return jsonify(error="job_not_found_or_worker_restarted"),404
+    if job.get("status")=="completed":
+        comparison=_compare_run_to_active_roster(
+            job["shift"],[r["employee_no"] for r in job.get("results",[])])
+        return jsonify(**job,**comparison,safe_to_mark_missing=False)
     return jsonify(**job,safe_to_mark_missing=False)
 
 @app.get("/api/v2/active-group")
@@ -440,6 +444,34 @@ def active_group():
     if job is None:
         return jsonify(status="idle",total=0,done=0,counts={})
     return jsonify(**job,safe_to_mark_missing=False)
+
+@app.get("/api/v2/roster-audit")
+@secure
+def roster_audit():
+    """Show the current roster and whether the last checked run is still valid."""
+    from group_runner import jobs
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT e.shift,count(*)
+                           FROM attendance_v2.employees e
+                           WHERE e.active=true GROUP BY e.shift ORDER BY e.shift""")
+            counts=dict(cur.fetchall())
+            cur.execute("SELECT count(*) FROM attendance_v2.employees WHERE active=false")
+            inactive=cur.fetchone()[0]
+    latest=next(((jid,j) for jid,j in reversed(list(jobs.items()))
+                 if j.get("status")=="completed"),None)
+    last=None
+    if latest:
+        jid,job=latest
+        last={"job_id":jid,"shift":job["shift"],"work_date":job["work_date"],
+              "total":job["total"],
+              **_compare_run_to_active_roster(
+                  job["shift"],[r["employee_no"] for r in job.get("results",[])])}
+    return jsonify(source="Supabase PostgreSQL / attendance_v2.employees",
+                   active_total=counts.get("D",0)+counts.get("N",0),
+                   shifts={"D":counts.get("D",0),"N":counts.get("N",0)},
+                   inactive_total=inactive,last_completed_run=last)
+
 
 @app.get("/api/v2/review-candidates")
 @secure
@@ -457,6 +489,25 @@ def review_candidates():
     return jsonify(review_only=True,confirmed_absent=0,runs=result,
                    note="Unverified scans are not confirmed absences. In-memory only.")
 
+def _compare_run_to_active_roster(shift, snapshot_ids):
+    """Compare employee IDs checked in one run with the current ACTIVE roster."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT employee_no FROM attendance_v2.employees
+                           WHERE active=true AND shift=%s""",(shift,))
+            current={r[0] for r in cur.fetchall()}
+    checked=set(snapshot_ids)
+    removed=sorted(checked-current)
+    added=sorted(current-checked)
+    return {
+        "roster_matches_current": not removed and not added,
+        "active_shift_count":len(current),
+        "checked_roster_count":len(checked),
+        "no_longer_in_shift":removed,
+        "not_checked_from_active_roster":added
+    }
+
+
 def _latest_completed_job():
     from group_runner import jobs
     return next(((jid,j) for jid,j in reversed(list(jobs.items())) if j.get("status")=="completed"),(None,None))
@@ -470,7 +521,10 @@ def _no_scan_report():
     missing.sort(key=lambda r:(r["department"],r["employee_no"]))
     from collections import Counter
     department_counts=dict(sorted(Counter(r["department"] for r in missing).items()))
-    return {"department_counts":department_counts,"job_id":jid,"department":job["department"],"shift":job["shift"],
+    comparison=_compare_run_to_active_roster(
+        job["shift"],[r["employee_no"] for r in job.get("results",[])])
+    return {"department_counts":department_counts,**comparison,
+            "job_id":jid,"department":job["department"],"shift":job["shift"],
             "work_date":job["work_date"],"total":job["total"],
             "scanned":job["counts"].get("SCAN_FOUND",0),
             "no_scan":len(missing),
