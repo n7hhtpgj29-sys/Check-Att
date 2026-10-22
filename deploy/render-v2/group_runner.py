@@ -27,13 +27,13 @@ def persist_completed_job(job_id):
                 (department_id,shift,work_date,trigger_type,status,started_at,finished_at,
                  total_employees,missing_count,error_count,scheduled_key)
                 VALUES ((SELECT id FROM attendance_v2.departments WHERE code='ALL'),
-                    %s,%s,%s,'completed',now(),now(),%s,%s,%s,%s)
-                ON CONFLICT(scheduled_key) DO UPDATE SET status='completed',finished_at=now(),
+                    %s,%s,%s,'completed',now(),%s::timestamptz,%s,%s,%s,%s)
+                ON CONFLICT(scheduled_key) DO UPDATE SET status='completed',finished_at=EXCLUDED.finished_at,
                     total_employees=EXCLUDED.total_employees,missing_count=EXCLUDED.missing_count,
                     error_count=EXCLUDED.error_count
                 RETURNING id""",
                 (job["shift"],job["work_date"],job.get("trigger_type","manual"),
-                 job["total"],job["counts"].get("NO_SCAN_IN_WINDOW",0),
+                 job["query_completed_at"],job["total"],job["counts"].get("NO_SCAN_IN_WINDOW",0),
                  job["counts"].get("INCOMPLETE",0)+job["counts"].get("QUERY_ERROR",0),key))
             run_id=cur.fetchone()[0]
             cur.execute("DELETE FROM attendance_v2.attendance_results WHERE run_id=%s",(run_id,))
@@ -69,6 +69,9 @@ def launch(job_id, employees, shift, work_date, department, employee_names,
                 jobs[job_id]["status"]="failed"
                 jobs[job_id]["error"]="collector_ended_before_roster_completed"
             else:
+                # Capture when the last employee was queried, prior to DB persistence
+                # or any later Make.com / LINE transmission delay.
+                jobs[job_id]["query_completed_at"]=datetime.now(timezone.utc).isoformat()
                 jobs[job_id]["status"]="completed"
                 try:
                     jobs[job_id]["persisted"]=persist_completed_job(job_id)
