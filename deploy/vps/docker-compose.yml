@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: attendance
+      POSTGRES_USER: attendance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - attendance_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U attendance -d attendance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+  web:
+    build:
+      context: ../..
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://attendance:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/attendance
+      REQUIRE_POSTGRES: "true"
+      PLAYWRIGHT_HEADLESS: "1"
+      PORT: "10000"
+      AUTO_QUERY_TOKEN: ${AUTO_QUERY_TOKEN:?Set AUTO_QUERY_TOKEN}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose: ["10000"]
+    networks: [internal]
+    # Web remains internal until authentication and HTTPS are implemented.
+volumes:
+  attendance_pg:
+networks:
+  internal:
+    internal: true
