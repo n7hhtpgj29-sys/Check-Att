@@ -594,8 +594,19 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key
                            JOIN attendance_v2.departments d ON d.id=e.department_id
                            WHERE a.run_id=%s ORDER BY d.code,a.employee_no""",(run_id,))
             rows=cur.fetchall()
+            cur.execute("""SELECT employee_no FROM attendance_v2.employees
+                           WHERE active=true AND shift=%s""",(s,))
+            current={r[0] for r in cur.fetchall()}
     if len(rows)!=total or total==0:
         return None
+    checked={r[0] for r in rows}
+    removed=sorted(checked-current)
+    added=sorted(current-checked)
+    roster_audit={"roster_matches_current":not removed and not added,
+                  "active_shift_count":len(current),
+                  "checked_roster_count":len(checked),
+                  "no_longer_in_shift":removed,
+                  "not_checked_from_active_roster":added}
     counts=Counter(r[3] for r in rows)
     import json
     missing=[]
@@ -610,7 +621,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key
                         "name":snapshot.get("name",r[1]),
                         "department":snapshot.get("department",r[2])})
     department_counts=dict(sorted(Counter(r["department"] for r in missing).items()))
-    return {"department_counts":department_counts,
+    return {"department_counts":department_counts,**roster_audit,
             "job_id":key or "V2:DB:"+str(run_id),
             "department":"ALL","shift":s,"work_date":str(day),
             "trigger_type":trigger_type,"status":"completed",
@@ -646,6 +657,14 @@ def no_scan_list():
         if scheduled_only:
             return jsonify(ready=False,status="not_ready",shift=shift,work_date=work_date),200
         return jsonify(error="no_matching_completed_run",shift=shift,work_date=work_date),404
+    if not report.get("roster_matches_current",False):
+        return jsonify(ready=False,error="roster_changed_after_scan",
+                       message="ผลตรวจชุดนี้ใช้รายชื่อก่อนแก้ไขทะเบียน กรุณากดตรวจทุกแผนกใหม่",
+                       shift=report["shift"],work_date=report["work_date"],
+                       previous_checked=report["total"],
+                       active_shift_count=report["active_shift_count"],
+                       no_longer_in_shift=report["no_longer_in_shift"],
+                       not_checked_from_active_roster=report["not_checked_from_active_roster"]),409
     return jsonify(ready=True,**report,line_message=_format_no_scan_message(report),
                    note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
 
@@ -655,6 +674,9 @@ def send_line():
     import urllib.request,json
     report=_no_scan_report()
     if not report:return jsonify(error="no_completed_run"),409
+    if not report.get("roster_matches_current",False):
+        return jsonify(error="roster_changed_after_scan",
+                       message="กรุณาตรวจพนักงานใหม่ก่อนส่ง LINE"),409
     token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
     recipient=os.getenv("LINE_TO_ID","")
     if not token or not recipient:
@@ -798,6 +820,10 @@ def line_delivery_claim():
             return jsonify(ready=False,claimed=False,reason="not_ready"),200
         if report["job_id"]!=expected or report["status"]!="completed" or report["department"]!="ALL":
             return jsonify(ready=False,claimed=False,reason="report_mismatch"),200
+        if not report.get("roster_matches_current",False):
+            return jsonify(ready=False,claimed=False,reason="roster_changed_after_scan",
+                           previous_checked=report["total"],
+                           active_shift_count=report["active_shift_count"]),200
         if report["query_errors"] or report["unverified"] or report["total"] <= 0 or (
             report["scanned"]+report["no_scan"] != report["total"]
         ):
