@@ -30,7 +30,7 @@ def home():
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. Review all-department no-scan results. LINE requires configuration.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
 <p><label>กะ <select id="test-shift"><option value="D">Today (D)</option><option value="N">Tonight (N)</option></select></label> <label>วันที่ <input id="work-date" type="date"></label></p>
-<p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="sendLine()">ส่ง LINE</button></p>
+<p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="auditRoster()">ตรวจยอดทะเบียน</button> <button onclick="sendLine()">ส่ง LINE</button></p>
 <div style="border:1px solid #d5deef;border-radius:10px;padding:14px;margin:14px 0">
 <strong>นำเข้าทะเบียนพนักงาน / Employee Roster</strong><p style="margin:8px 0;font-size:13px">รองรับ CSV: Emp., Name, Dept, SHIFT (DS/NS หรือ D/N)</p>
 <input type="file" id="roster-file" accept=".csv,text/csv" style="width:100%;max-width:100%;box-sizing:border-box">
@@ -74,12 +74,42 @@ async function runGroup(){
  }catch(e){out.textContent='Run request failed'}
 }
 \nfunction loadSummary(){display('/api/v2/summary')}
+async function auditRoster(){
+ out.textContent='กำลังตรวจยอดทะเบียน Active จาก Supabase...';
+ try{
+  const response=await fetch('/api/v2/roster-audit',{headers:headers()});
+  const data=await response.json();
+  if(!response.ok){out.textContent='ตรวจยอดไม่สำเร็จ: '+(data.error||response.status);return}
+  const lines=['ฐานข้อมูล: '+data.source,
+    'ทะเบียน Active '+data.active_total+' คน | กะ D '+data.shifts.D+' คน | กะ N '+data.shifts.N+' คน',
+    'พนักงานที่ปิดใช้งาน: '+data.inactive_total+' คน'];
+  if(data.last_completed_run){
+   const x=data.last_completed_run;
+   lines.push('','ผลตรวจล่าสุด ('+x.source+'): กะ '+x.shift+' วันที่ '+x.work_date,
+              'รอบนี้ตรวจ '+x.total+' คน | Active ปัจจุบันกะนี้ '+x.active_shift_count+' คน',
+              x.roster_matches_current?'ผลตรวจตรงกับทะเบียน Active ล่าสุด':'ผลตรวจเก่าไม่ตรงทะเบียน Active — ต้องตรวจใหม่');
+   if(x.no_longer_in_shift?.length)lines.push('รหัสในผลเก่าแต่ไม่อยู่ในกะ Active: '+x.no_longer_in_shift.join(', '));
+   if(x.not_checked_from_active_roster?.length)lines.push('รหัส Active ที่ไม่ถูกตรวจ: '+x.not_checked_from_active_roster.join(', '));
+  }
+  out.textContent=lines.join(String.fromCharCode(10));
+ }catch(e){out.textContent='ตรวจยอดไม่สำเร็จ: '+e.message}
+}
 async function loadMissing(){
  out.textContent='กำลังโหลดสรุปรายชื่อ...';
  try{
   const r=await fetch('/api/v2/no-scan-list',{headers:headers()});
   const j=await r.json();
-  if(!r.ok){out.textContent='ยังไม่มีผลการตรวจที่เสร็จสมบูรณ์: '+(j.error||r.status);return}
+  if(!r.ok){
+   if(j.error==='roster_changed_after_scan'){
+    out.textContent='ผลตรวจเดิมไม่ตรงทะเบียนล่าสุด — ยังไม่ใช่ข้อมูลสำหรับส่ง LINE'+
+     '\\nรอบเดิมตรวจ '+j.previous_checked+' คน | Active ปัจจุบันกะ '+j.shift+': '+j.active_shift_count+' คน'+
+     '\\nคนในผลเก่าที่ไม่ได้ Active ในกะนี้: '+(j.no_longer_in_shift||[]).join(', ')+
+     '\\nคนใน Active ปัจจุบันที่ไม่ถูกตรวจในรอบเดิม: '+(j.not_checked_from_active_roster||[]).join(', ')+
+     '\\nกรุณากด ตรวจทุกแผนก ใหม่ก่อนสรุป';
+    return;
+   }
+   out.textContent='ยังไม่มีผลตรวจที่พร้อมใช้: '+(j.message||j.error||r.status);return
+  }
   const lines=['🚨 Attendance — ผู้ยังไม่สแกน',
    'วันที่: '+j.work_date,'กะ: '+j.shift+' | ทุกแผนก',
    'Total HC: '+j.total,'Present: '+j.scanned,
@@ -128,7 +158,16 @@ async function uploadRoster(){
   status.textContent='นำเข้าสำเร็จ ✓ '+result.imported+' คน | เพิ่มใหม่ '+result.added+
    ' | เปลี่ยนข้อมูล '+result.changed+' | ปิดคนที่ไม่มีในไฟล์ '+result.deactivated+
    '\\nกะ D '+result.shifts.D+' คน / กะ N '+result.shifts.N+' คน'+
-   '\\nยอดพนักงาน Active หลังนำเข้า: '+result.active_total;
+   '\\nยอดพนักงาน Active หลังนำเข้า: '+result.active_total+
+   '\\nผลตรวจเดิมใช้ทะเบียนก่อน Import กรุณากด ตรวจทุกแผนก ใหม่';
+  runId='';
+  sessionStorage.removeItem('v2-run-id');
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+  document.getElementById('run-status').textContent='ทะเบียนอัปเดตแล้ว — ต้องตรวจใหม่';
+  document.getElementById('run-bar').style.width='0%';
+  document.getElementById('run-detail').textContent='Active D '+result.shifts.D+' / N '+result.shifts.N+' | ผลเดิมถูกยกเลิกจากหน้าจอ';
+  out.textContent='นำเข้าแล้ว '+result.active_total+' คน (D '+result.shifts.D+', N '+result.shifts.N+')'+
+    '\\nโปรดกด ตรวจทุกแผนก เพื่อใช้ทะเบียนล่าสุด';
  }catch(e){status.textContent='การเชื่อมต่อล้มเหลว: '+e.message}
  finally{button.disabled=false}
 }
@@ -464,9 +503,19 @@ def roster_audit():
     if latest:
         jid,job=latest
         last={"job_id":jid,"shift":job["shift"],"work_date":job["work_date"],
-              "total":job["total"],
+              "total":job["total"],"source":"current_server_memory",
               **_compare_run_to_active_roster(
                   job["shift"],[r["employee_no"] for r in job.get("results",[])])}
+    else:
+        saved=_db_no_scan_report()
+        if saved:
+            last={"job_id":saved["job_id"],"shift":saved["shift"],
+                  "work_date":saved["work_date"],"total":saved["total"],
+                  "source":"attendance_v2.attendance_runs",
+                  "roster_matches_current":saved["roster_matches_current"],
+                  "active_shift_count":saved["active_shift_count"],
+                  "no_longer_in_shift":saved["no_longer_in_shift"],
+                  "not_checked_from_active_roster":saved["not_checked_from_active_roster"]}
     return jsonify(source="Supabase PostgreSQL / attendance_v2.employees",
                    active_total=counts.get("D",0)+counts.get("N",0),
                    shifts={"D":counts.get("D",0),"N":counts.get("N",0)},
