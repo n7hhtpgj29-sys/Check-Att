@@ -133,6 +133,7 @@ async function loadMissing(){
    for(const e of grouped[d].sort((a,b)=>a.employee_no.localeCompare(b.employee_no)))lines.push('• '+e.employee_no+' - '+e.name);
   }
   if(!j.employees.length)lines.push('ไม่พบรายชื่อผู้ยังไม่สแกน');
+  lines.push('','ข้อมูลล่าสุด query เมื่อ : '+(j.last_query_display||'ไม่พบเวลาจบการตรวจ'));
   out.textContent=lines.join(String.fromCharCode(10));
  }catch(e){out.textContent='โหลดสรุปไม่สำเร็จ: '+e.message}
 }\nfunction sendLine(){if(!confirm('Send the latest completed no-scan list to the configured LINE recipient?'))return;display('/api/v2/send-line',{method:'POST'})}
@@ -583,11 +584,27 @@ def _no_scan_report():
     return {"department_counts":department_counts,**comparison,
             "job_id":jid,"department":job["department"],"shift":job["shift"],
             "work_date":job["work_date"],"total":job["total"],
+            "last_query_at":job.get("query_completed_at") or job.get("finished_at"),
             "scanned":job["counts"].get("SCAN_FOUND",0),
             "no_scan":len(missing),
             "unverified":job["counts"].get("INCOMPLETE",0),
             "query_errors":job["counts"].get("QUERY_ERROR",0),
             "employees":missing}
+
+def _format_query_completed_at(value):
+    """Format the actual scan completion time in Bangkok, not LINE sent time."""
+    if not value:
+        return "ไม่พบเวลาจบการตรวจ"
+    try:
+        moment=datetime.fromisoformat(value.replace("Z","+00:00")) if isinstance(value,str) else value
+        if moment.tzinfo is None:
+            moment=moment.replace(tzinfo=BKK)
+        moment=moment.astimezone(BKK)
+    except (TypeError,ValueError,AttributeError):
+        return "ไม่พบเวลาจบการตรวจ"
+    month=("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")[moment.month-1]
+    return f"{moment.day:02d}/{month}/{moment.year:04d} {moment:%H:%M:%S}"
+
 
 def _format_no_scan_message(report):
     from datetime import timedelta
@@ -614,6 +631,7 @@ def _format_no_scan_message(report):
         lines += ["• "+r["employee_no"]+" - "+r["name"] for r in report["employees"] if r["department"]==dept]
     if not report["employees"]:
         lines.append("ไม่พบรายชื่อผู้ยังไม่สแกน")
+    lines.extend(["", "ข้อมูลล่าสุด query เมื่อ : "+_format_query_completed_at(report.get("last_query_at"))])
     return "\n".join(lines)
 
 
@@ -634,7 +652,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key
         conditions.append("r.scheduled_key=%s")
         args.append(run_key)
     query="""SELECT r.id,r.shift,r.work_date,r.total_employees,
-                    r.trigger_type,r.scheduled_key
+                    r.trigger_type,r.scheduled_key,r.finished_at
              FROM attendance_v2.attendance_runs r
              JOIN attendance_v2.departments d ON d.id=r.department_id
              WHERE """+" AND ".join(conditions)+" ORDER BY r.finished_at DESC,r.id DESC LIMIT 1"
@@ -644,7 +662,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key
             row=cur.fetchone()
             if row is None:
                 return None
-            run_id,s,day,total,trigger_type,key=row
+            run_id,s,day,total,trigger_type,key,query_finished_at=row
             cur.execute("""SELECT a.employee_no,e.full_name,d.name,a.status,a.detail
                            FROM attendance_v2.attendance_results a
                            JOIN attendance_v2.employees e ON e.employee_no=a.employee_no
@@ -682,6 +700,7 @@ def _db_no_scan_report(shift=None, work_date=None, scheduled_only=False, run_key
             "job_id":key or "V2:DB:"+str(run_id),
             "department":"ALL","shift":s,"work_date":str(day),
             "trigger_type":trigger_type,"status":"completed",
+            "last_query_at":query_finished_at.isoformat() if query_finished_at else None,
             "total":total,"scanned":counts.get("SCAN_FOUND",0),
             "no_scan":len(missing),"unverified":counts.get("INCOMPLETE",0),
             "query_errors":counts.get("QUERY_ERROR",0),"employees":missing}
@@ -722,7 +741,9 @@ def no_scan_list():
                        active_shift_count=report["active_shift_count"],
                        no_longer_in_shift=report["no_longer_in_shift"],
                        not_checked_from_active_roster=report["not_checked_from_active_roster"]),409
-    return jsonify(ready=True,**report,line_message=_format_no_scan_message(report),
+    return jsonify(ready=True,**report,
+                   last_query_display=_format_query_completed_at(report.get("last_query_at")),
+                   line_message=_format_no_scan_message(report),
                    note="No scan detected, not confirmed absence; verify leave and shift exceptions.")
 
 @app.post("/api/v2/send-line")
@@ -748,6 +769,8 @@ def send_line():
     for dept,count in report['department_counts'].items():
         lines.append(f'[{dept}] — {count} คน')
         lines += ['• '+r['employee_no']+' - '+r['name'] for r in report['employees'] if r['department']==dept]
+    lines.append("")
+    lines.append("ข้อมูลล่าสุด query เมื่อ : "+_format_query_completed_at(report.get("last_query_at")))
     lines.append("No scan is not confirmed absence; check leave records.")
     message="\n".join(lines)
     if len(message)>4800:
