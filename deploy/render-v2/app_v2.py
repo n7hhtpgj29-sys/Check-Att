@@ -395,9 +395,14 @@ def test_one():
                 row=cur.fetchone()
         if not row:
             return jsonify(error="no_day_shift_employee"),400
-        from collector_v2 import query_employee
-        result=query_employee(row[0],"D")
-        return jsonify(result)
+        # Use the SAME collector as the scheduled V2 run, not the obsolete
+        # single-person diagnostic that had a different query implementation.
+        from fast_collector import scan_group
+        shift_date=datetime.now(BKK).date().isoformat()
+        status=next(scan_group([row[0]],"D",shift_date),"QUERY_ERROR")
+        return jsonify(employee_no=row[0],status=status,
+                       safe_to_mark_missing=False,
+                       note="Diagnostic only. Does not store results or send LINE.")
     except Exception:
         app.logger.exception("Single scan diagnostic failed")
         return jsonify(status="QUERY_ERROR",safe_to_mark_missing=False,error="query_failed"),503
