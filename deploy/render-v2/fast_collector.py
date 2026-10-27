@@ -142,6 +142,8 @@ def scan_group(ids, shift, work_date):
                         result, reason = _one_query(page, employee_no, shift, day,
                             refresh_page=not reuse, read_timeout=3 if reuse else 10)
                         if result in ("SCAN_FOUND", "NO_SCAN_IN_WINDOW"):
+                            if reuse:
+                                reuse_failures = 0
                             break
                         if reuse:
                             reuse_failures += 1
@@ -160,9 +162,15 @@ def scan_group(ids, shift, work_date):
                     # No employee names, IDs or raw scan data in server logs.
                     log.warning("V2 source query unverified index=%d reason=%s status=%s",
                                 i, reason, result)
+                duration = time.monotonic() - started
+                times.append(duration)
+                if i % 10 == 0 or i == len(ids):
+                    recent = times[-10:]
+                    log.info("V2 query progress %d/%d, average last 10: %.2fs, reuse=%s",
+                             i, len(ids), sum(recent) / len(recent), allow_reuse)
                 yield result
-                # Give the source server a small breather between employees.
-                page.wait_for_timeout(300)
+                # Short throttle; the browser continues through verified AJAX updates.
+                page.wait_for_timeout(120)
             context.close()
         finally:
             browser.close()
