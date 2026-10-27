@@ -30,7 +30,7 @@ def home():
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. Review all-department no-scan results. LINE requires configuration.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
 <p><label>กะ <select id="test-shift"><option value="D">Today (D)</option><option value="N">Tonight (N)</option></select></label> <label>วันที่ <input id="work-date" type="date"></label></p>
-<p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="auditRoster()">ตรวจยอดทะเบียน</button> <button onclick="sendLine()">ส่ง LINE</button></p>
+<p><button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="auditRoster()">ตรวจยอดทะเบียน</button> <button onclick="sendLine()">ส่ง LINE</button></p><p><label>ทดสอบการอ่านจากเว็บต้นทาง 1 คน (ไม่ส่ง LINE): <input id="diag-emp" placeholder="EMP NO." maxlength="24" style="max-width:145px"></label> <button type="button" onclick="testOne()">ทดสอบ 1 คน</button></p>
 <div style="border:1px solid #d5deef;border-radius:10px;padding:14px;margin:14px 0">
 <strong>นำเข้าทะเบียนพนักงาน / Employee Roster</strong><p style="margin:8px 0;font-size:13px">รองรับ CSV: Emp., Name, Dept, SHIFT (DS/NS หรือ D/N)</p>
 <input type="file" id="roster-file" accept=".csv,text/csv" style="width:100%;max-width:100%;box-sizing:border-box">
@@ -45,7 +45,7 @@ function headers(){return {'X-Admin-Token':sessionStorage.getItem('v2-admin-toke
 document.getElementById('token').value=sessionStorage.getItem('v2-admin-token')||'';
 document.getElementById('token').addEventListener('input',e=>sessionStorage.setItem('v2-admin-token',e.target.value));
 async function display(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});out.textContent=JSON.stringify(await r.json(),null,2)}catch(e){out.textContent='Request failed'}}
-function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='Checking one employee...';display('/api/v2/test-one',{method:'POST'})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nlet runId=sessionStorage.getItem('v2-run-id')||'',pollTimer=null;
+function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='กำลังอ่านข้อมูล 1 คน โดยไม่ส่ง LINE...';display('/api/v2/test-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({employee_no:document.getElementById('diag-emp').value.trim()})})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nlet runId=sessionStorage.getItem('v2-run-id')||'',pollTimer=null;
 function showJob(j){
  if(j.job_id){runId=j.job_id;sessionStorage.setItem('v2-run-id',runId)}
  const done=j.done||0,total=j.total||0;
@@ -387,25 +387,37 @@ def source_probe():
 @app.post("/api/v2/test-one")
 @secure
 def test_one():
-    """Read-only one-person scan test. Never creates a missing record."""
+    """Read-only test of one active employee with the current V2 collector."""
+    from datetime import date as _date
+    import re
+    payload=request.get_json(silent=True) or {}
+    if not isinstance(payload,dict):
+        return jsonify(error="invalid_json"),400
+    employee_no=str(payload.get("employee_no") or "").strip().upper()
+    if employee_no and not re.fullmatch(r"[A-Z0-9-]{2,24}",employee_no):
+        return jsonify(error="invalid_employee_no"),400
     try:
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT employee_no FROM attendance_v2.employees WHERE active AND shift='D' ORDER BY employee_no LIMIT 1")
+                if employee_no:
+                    cur.execute("""SELECT employee_no,shift FROM attendance_v2.employees
+                                   WHERE employee_no=%s AND active=true""",(employee_no,))
+                else:
+                    cur.execute("""SELECT employee_no,shift FROM attendance_v2.employees
+                                   WHERE active=true AND shift='D' ORDER BY employee_no LIMIT 1""")
                 row=cur.fetchone()
-        if not row:
-            return jsonify(error="no_day_shift_employee"),400
-        # Use the SAME collector as the scheduled V2 run, not the obsolete
-        # single-person diagnostic that had a different query implementation.
+        if row is None:
+            return jsonify(error="employee_not_active_or_not_found"),404
         from fast_collector import scan_group
         shift_date=datetime.now(BKK).date().isoformat()
-        status=next(scan_group([row[0]],"D",shift_date),"QUERY_ERROR")
-        return jsonify(employee_no=row[0],status=status,
-                       safe_to_mark_missing=False,
-                       note="Diagnostic only. Does not store results or send LINE.")
+        status=next(scan_group([row[0]],row[1],shift_date),"QUERY_ERROR")
+        return jsonify(employee_no=row[0],shift=row[1],work_date=shift_date,
+                       status=status,safe_to_mark_missing=False,
+                       note="Read-only single employee diagnostic. No LINE push or stored attendance.")
     except Exception:
-        app.logger.exception("Single scan diagnostic failed")
-        return jsonify(status="QUERY_ERROR",safe_to_mark_missing=False,error="query_failed"),503
+        app.logger.exception("V2 collector single-employee diagnostic failed")
+        return jsonify(status="QUERY_ERROR",safe_to_mark_missing=False,
+                       error="source_or_browser_failure"),503
 
 @app.post("/api/v2/test-batch")
 @secure
