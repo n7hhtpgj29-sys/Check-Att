@@ -129,16 +129,26 @@ def scan_group(ids, shift, work_date):
             context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             page = context.new_page()
+            allow_reuse = True
+            reuse_failures = 0
+            times = []
             for i, employee_no in enumerate(ids, 1):
+                started = time.monotonic()
+                fast_attempt = i > 1 and allow_reuse
                 result, reason = "QUERY_ERROR", "UNEXPECTED_ERROR"
                 for attempt in range(2):
                     try:
-                        result, reason = _one_query(page, employee_no, shift, day)
+                        reuse = (attempt == 0 and fast_attempt)
+                        result, reason = _one_query(page, employee_no, shift, day,
+                            refresh_page=not reuse, read_timeout=3 if reuse else 10)
                         if result in ("SCAN_FOUND", "NO_SCAN_IN_WINDOW"):
                             break
-                        # Retry source failures on a fresh page once, like Production.
+                        if reuse:
+                            reuse_failures += 1
+                            if reuse_failures >= 3:
+                                allow_reuse = False
                         if attempt == 0:
-                            page.wait_for_timeout(500)
+                            page.wait_for_timeout(350)
                     except Exception as exc:
                         result, reason = "QUERY_ERROR", type(exc).__name__
                         try:
