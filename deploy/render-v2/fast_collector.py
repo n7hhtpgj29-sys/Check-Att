@@ -63,12 +63,13 @@ def _read_matching_records(page, employee_no, timeout=10):
     return "NO_VERIFIED_ROWS", []
 
 
-def _one_query(page, employee_no, shift, day):
+def _one_query(page, employee_no, shift, day, refresh_page=True, read_timeout=10):
     # Production PWA navigates afresh for EACH employee. Reusing the same page
     # made old V2 vulnerable to stale AJAX state and missing submit controls.
-    response = page.goto(SOURCE, wait_until="domcontentloaded", timeout=30000)
-    if response is None or response.status != 200:
-        return "QUERY_ERROR", "SOURCE_HTTP_ERROR"
+    if refresh_page:
+        response = page.goto(SOURCE, wait_until="domcontentloaded", timeout=30000)
+        if response is None or response.status != 200:
+            return "QUERY_ERROR", "SOURCE_HTTP_ERROR"
     field = page.locator("input").first
     field.wait_for(state="visible", timeout=10000)
     field.fill(employee_no, timeout=8000)
@@ -86,7 +87,7 @@ def _one_query(page, employee_no, shift, day):
         # have submitted, or the source may update on input.
         log.warning("V2 collector submit issue: %s", type(exc).__name__)
 
-    reason, found = _read_matching_records(page, employee_no, timeout=10)
+    reason, found = _read_matching_records(page, employee_no, timeout=read_timeout)
     if not found:
         return ("QUERY_ERROR" if reason == "BAD_TIMESTAMP_FORMAT" else "INCOMPLETE"), reason
 
