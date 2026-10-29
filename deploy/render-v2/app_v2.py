@@ -999,6 +999,35 @@ def line_delivery_ack():
         return jsonify(error="ack_database_unavailable"),503
 
 
+@app.post("/api/v2/webhook-smoke-test")
+@secure
+def webhook_smoke_test():
+    """Send a synthetic event: no matching completed run, so LINE claim cannot succeed."""
+    from webhook_bridge import configured_webhook
+    import urllib.request
+    import json
+    import uuid
+    url=configured_webhook()
+    if not url:
+        return jsonify(error="make_webhook_not_configured"),409
+    invocation_id=str(uuid.uuid4())
+    day=datetime.now(BKK).date().isoformat()
+    data=json.dumps({"event":"attendance_v2.smoke_test",
+        "job_id":"V2:ALL:D:"+day+":"+invocation_id,
+        "invocation_id":invocation_id,"shift":"D","work_date":day
+    }).encode("utf-8")
+    try:
+        req=urllib.request.Request(url,data=data,method="POST",
+            headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=20) as response:
+            accepted=200<=response.status<300
+        return jsonify(webhook_accepted=accepted,event="attendance_v2.smoke_test",
+                       safe_no_completed_run=True)
+    except Exception:
+        app.logger.exception("V2 smoke test webhook failed")
+        return jsonify(error="make_webhook_unreachable"),502
+
+
 @app.get("/api/v2/webhook-status")
 @secure
 def webhook_status():
