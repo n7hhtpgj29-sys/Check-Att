@@ -629,7 +629,8 @@ def _format_no_scan_message(report):
     date_label=day.strftime("%d/%m/%Y")
     if report["shift"]=="N":
         date_label+=" → "+(day+timedelta(days=1)).strftime("%d/%m/%Y")
-    lines=["🚨 Attendance — ผู้ยังไม่สแกน",
+    incomplete=report["query_errors"]+report["unverified"]
+    lines=["⚠️ Attendance — รายงานตรวจไม่ครบ" if incomplete else "🚨 Attendance — ผู้ยังไม่สแกน",
            "วันที่: "+date_label,
            "กะ: "+report["shift"]+" | ทุกแผนก",
            "",
@@ -639,6 +640,8 @@ def _format_no_scan_message(report):
            "Query Error: "+str(report["query_errors"]),
            "ตรวจไม่ครบ: "+str(report["unverified"]),
            "",
+           *(["⚠️ ข้อมูลไม่สมบูรณ์: ยืนยันผู้ไม่สแกนได้เฉพาะรายที่อ่านสำเร็จ",
+              "พนักงานที่ Query Error/ตรวจไม่ครบยังไม่ถูกนับเป็น No Scan", ""] if incomplete else []),
            "สรุปแยกแผนก:"]
     lines += [dept+": "+str(count)+" คน" for dept,count in report["department_counts"].items()]
     lines.append("")
@@ -921,10 +924,13 @@ def line_delivery_claim():
             return jsonify(ready=False,claimed=False,reason="roster_changed_after_scan",
                            previous_checked=report["total"],
                            active_shift_count=report["active_shift_count"]),200
-        if report["query_errors"] or report["unverified"] or report["total"] <= 0 or (
-            report["scanned"]+report["no_scan"] != report["total"]
+        # A degraded source must still produce an operational LINE warning.
+        # Unverified employees never become No Scan; the message explicitly
+        # labels confirmed results versus Query Error / Incomplete.
+        if report["total"] <= 0 or (
+            report["scanned"]+report["no_scan"]+report["query_errors"]+report["unverified"] != report["total"]
         ):
-            return jsonify(ready=False,claimed=False,reason="incomplete_report"),200
+            return jsonify(ready=False,claimed=False,reason="inconsistent_report"),200
         message=_format_no_scan_message(report)
         if len(message)>4800:
             return jsonify(ready=False,claimed=False,reason="line_message_too_long"),200
@@ -942,7 +948,8 @@ def line_delivery_claim():
             return jsonify(ready=True,claimed=False,already_claimed=True,job_id=expected,invocation_id=invocation_id),200
         return jsonify(ready=True,claimed=True,job_id=expected,
                        invocation_id=invocation_id,line_message=message,shift=shift,work_date=work_date,
-                       total=report["total"],no_scan=report["no_scan"]),200
+                       total=report["total"],no_scan=report["no_scan"],
+                       query_errors=report["query_errors"],unverified=report["unverified"]),200
     except Exception:
         app.logger.exception("V2 LINE delivery claim failure")
         return jsonify(error="claim_database_unavailable"),503
