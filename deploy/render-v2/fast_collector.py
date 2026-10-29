@@ -63,16 +63,16 @@ def _read_matching_records(page, employee_no, timeout=10):
     return "NO_VERIFIED_ROWS", []
 
 
-def _one_query(page, employee_no, shift, day, refresh_page=True, read_timeout=10):
+def _one_query(page, employee_no, shift, day, refresh_page=True, read_timeout=7):
     # Production PWA navigates afresh for EACH employee. Reusing the same page
     # made old V2 vulnerable to stale AJAX state and missing submit controls.
     if refresh_page:
-        response = page.goto(SOURCE, wait_until="domcontentloaded", timeout=30000)
+        response = page.goto(SOURCE, wait_until="domcontentloaded", timeout=12000)
         if response is None or response.status != 200:
             return "QUERY_ERROR", "SOURCE_HTTP_ERROR"
     field = page.locator("input").first
-    field.wait_for(state="visible", timeout=10000)
-    field.fill(employee_no, timeout=8000)
+    field.wait_for(state="visible", timeout=5000)
+    field.fill(employee_no, timeout=4000)
     go = page.get_by_role("button", name=re.compile(r"^\s*GO\s*$", re.I))
     try:
         if go.count():
@@ -132,7 +132,15 @@ def scan_group(ids, shift, work_date):
             allow_reuse = True
             reuse_failures = 0
             times = []
+            # Make waits about 260 seconds; leave time for report persistence.
+            run_deadline = time.monotonic() + 195
             for i, employee_no in enumerate(ids, 1):
+                if time.monotonic() >= run_deadline:
+                    remaining = len(ids) - i + 1
+                    log.warning("V2 source budget exhausted; %d rows unverified", remaining)
+                    for _ in range(remaining):
+                        yield "QUERY_ERROR"
+                    break
                 started = time.monotonic()
                 fast_attempt = i > 1 and allow_reuse
                 result, reason = "QUERY_ERROR", "UNEXPECTED_ERROR"
@@ -140,7 +148,7 @@ def scan_group(ids, shift, work_date):
                     try:
                         reuse = (attempt == 0 and fast_attempt)
                         result, reason = _one_query(page, employee_no, shift, day,
-                            refresh_page=not reuse, read_timeout=3 if reuse else 10)
+                            refresh_page=not reuse, read_timeout=2 if reuse else 7)
                         if result in ("SCAN_FOUND", "NO_SCAN_IN_WINDOW"):
                             if reuse:
                                 reuse_failures = 0
