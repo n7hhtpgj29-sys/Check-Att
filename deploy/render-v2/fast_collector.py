@@ -106,7 +106,7 @@ def _one_query(page, employee_no, shift, day, refresh_page=True, read_timeout=7)
     return "INCOMPLETE", "SHIFT_NOT_STARTED"
 
 
-def scan_group(ids, shift, work_date):
+def scan_group(ids, shift, work_date, progress_callback=None):
     """Yield exactly one of the four existing statuses for every employee.
 
     The job runner persists no-scan reports only when the entire query is
@@ -164,6 +164,9 @@ def scan_group(ids, shift, work_date):
                     if attempt == 0:
                         page.wait_for_timeout(350)
                 outcomes[i] = result
+                if progress_callback:
+                    progress_callback(stage="first_pass", checked=i + 1,
+                                      total=len(ids), retry_pending=sum(s in ("QUERY_ERROR", "INCOMPLETE") for s in outcomes[:i+1]))
                 if result in ("QUERY_ERROR", "INCOMPLETE"):
                     log.warning("V2 initial scan unverified index=%d reason=%s status=%s",
                                 i + 1, reason, result)
@@ -183,6 +186,9 @@ def scan_group(ids, shift, work_date):
                 if not pending:
                     break
                 log.info("V2 retry pass %d pending=%d", retry_round, len(pending))
+                if progress_callback:
+                    progress_callback(stage="retry_"+str(retry_round), checked=len(ids),
+                                      total=len(ids), retry_pending=len(pending))
                 # Small cooldown prevents immediate overload when source is slow.
                 page.wait_for_timeout(2000)
                 for i in pending:
