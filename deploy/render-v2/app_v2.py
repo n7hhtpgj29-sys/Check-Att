@@ -999,6 +999,51 @@ def line_delivery_ack():
         return jsonify(error="ack_database_unavailable"),503
 
 
+@app.get("/api/v2/webhook-status")
+@secure
+def webhook_status():
+    """Show outbound Make webhook readiness without revealing its secret URL."""
+    from webhook_bridge import configured_webhook, ensure_outbox
+    try:
+        enabled=bool(configured_webhook())
+        with connect() as conn:
+            with conn.cursor() as cur:
+                ensure_outbox(cur)
+                cur.execute("""SELECT job_key,shift,work_date,state,attempts,last_error,
+                                      created_at,delivered_at
+                               FROM attendance_v2.webhook_outbox
+                               ORDER BY created_at DESC LIMIT 5""")
+                rows=cur.fetchall()
+        return jsonify(configured=enabled,mode="completion_webhook",
+                       pending=[{"job_id":r[0],"shift":r[1],
+                                 "work_date":str(r[2]),"state":r[3],
+                                 "attempts":r[4],"last_error":r[5],
+                                 "created_at":r[6].isoformat(),
+                                 "delivered_at":r[7].isoformat() if r[7] else None}
+                                for r in rows])
+    except Exception:
+        app.logger.exception("V2 Make webhook status read failed")
+        return jsonify(error="webhook_status_unavailable"),503
+
+
+@app.post("/api/v2/webhook-retry")
+@secure
+def webhook_retry():
+    """Retry delivery of a completed run's pending webhook after configuration."""
+    from webhook_bridge import dispatch
+    data=request.get_json(silent=True) or {}
+    key=data.get("job_id") if isinstance(data,dict) else None
+    if not isinstance(key,str) or not re.fullmatch(
+            r"V2:ALL:[DN]:\\d{4}-\\d{2}-\\d{2}:[a-f0-9-]{36}",key):
+        return jsonify(error="valid_completed_job_id_required"),400
+    try:
+        result=dispatch(key)
+    except Exception:
+        app.logger.exception("V2 outbound webhook retry failed")
+        return jsonify(error="webhook_retry_unavailable"),503
+    return jsonify(**result)
+
+
 @app.post("/api/v2/line-delivery-wait")
 @secure
 def line_delivery_wait():
