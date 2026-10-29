@@ -113,6 +113,8 @@ def scan_group(ids, shift, work_date):
     complete and there are zero QUERY_ERROR/INCOMPLETE results.
     """
     day = datetime.strptime(work_date, "%Y-%m-%d").date()
+    # Keep a result slot for every employee until all retry passes complete.
+    outcomes = ["INCOMPLETE"] * len(ids)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=False,
@@ -132,33 +134,18 @@ def scan_group(ids, shift, work_date):
             allow_reuse = True
             reuse_failures = 0
             times = []
-            # Make waits about 260 seconds; leave time for report persistence.
-            run_deadline = time.monotonic() + 195
-            for i, employee_no in enumerate(ids, 1):
-                if time.monotonic() >= run_deadline:
-                    remaining = len(ids) - i + 1
-                    log.warning("V2 source budget exhausted; %d rows unverified", remaining)
-                    for _ in range(remaining):
-                        yield "QUERY_ERROR"
-                    break
+            # First pass: fast AJAX query where verified, then fresh-page retry.
+            # Never synthesize QUERY_ERROR for people not yet queried.
+            for i, employee_no in enumerate(ids):
                 started = time.monotonic()
-                fast_attempt = i > 1 and allow_reuse
-                result, reason = "QUERY_ERROR", "UNEXPECTED_ERROR"
+                result, reason = "INCOMPLETE", "NO_VERIFIED_ROWS"
                 for attempt in range(2):
+                    reuse = (attempt == 0 and i > 0 and allow_reuse)
                     try:
-                        reuse = (attempt == 0 and fast_attempt)
-                        result, reason = _one_query(page, employee_no, shift, day,
-                            refresh_page=not reuse, read_timeout=2 if reuse else 7)
-                        if result in ("SCAN_FOUND", "NO_SCAN_IN_WINDOW"):
-                            if reuse:
-                                reuse_failures = 0
-                            break
-                        if reuse:
-                            reuse_failures += 1
-                            if reuse_failures >= 3:
-                                allow_reuse = False
-                        if attempt == 0:
-                            page.wait_for_timeout(350)
+                        result, reason = _one_query(
+                            page, employee_no, shift, day,
+                            refresh_page=not reuse,
+                            read_timeout=5 if reuse else 15)
                     except Exception as exc:
                         result, reason = "QUERY_ERROR", type(exc).__name__
                         try:
@@ -166,19 +153,59 @@ def scan_group(ids, shift, work_date):
                         except Exception:
                             pass
                         page = context.new_page()
+                    if result in ("SCAN_FOUND", "NO_SCAN_IN_WINDOW"):
+                        if reuse:
+                            reuse_failures = 0
+                        break
+                    if reuse:
+                        reuse_failures += 1
+                        if reuse_failures >= 3:
+                            allow_reuse = False
+                    if attempt == 0:
+                        page.wait_for_timeout(350)
+                outcomes[i] = result
                 if result in ("QUERY_ERROR", "INCOMPLETE"):
-                    # No employee names, IDs or raw scan data in server logs.
-                    log.warning("V2 source query unverified index=%d reason=%s status=%s",
-                                i, reason, result)
-                duration = time.monotonic() - started
-                times.append(duration)
-                if i % 10 == 0 or i == len(ids):
+                    log.warning("V2 initial scan unverified index=%d reason=%s status=%s",
+                                i + 1, reason, result)
+                times.append(time.monotonic() - started)
+                if (i + 1) % 10 == 0 or i + 1 == len(ids):
                     recent = times[-10:]
-                    log.info("V2 query progress %d/%d, average last 10: %.2fs, reuse=%s",
-                             i, len(ids), sum(recent) / len(recent), allow_reuse)
-                yield result
-                # Short throttle; the browser continues through verified AJAX updates.
+                    log.info("V2 first pass %d/%d avg_last_10=%.2fs pending=%d",
+                             i + 1, len(ids), sum(recent)/len(recent),
+                             sum(s in ("QUERY_ERROR", "INCOMPLETE") for s in outcomes[:i+1]))
                 page.wait_for_timeout(120)
+
+            # Second phase: retry ONLY unverified employees using a fresh page.
+            # No successful employee is queried again within this job.
+            for retry_round in (1, 2):
+                pending = [i for i, status in enumerate(outcomes)
+                           if status in ("QUERY_ERROR", "INCOMPLETE")]
+                if not pending:
+                    break
+                log.info("V2 retry pass %d pending=%d", retry_round, len(pending))
+                # Small cooldown prevents immediate overload when source is slow.
+                page.wait_for_timeout(2000)
+                for i in pending:
+                    employee_no = ids[i]
+                    try:
+                        result, reason = _one_query(
+                            page, employee_no, shift, day,
+                            refresh_page=True, read_timeout=20)
+                    except Exception as exc:
+                        result, reason = "QUERY_ERROR", type(exc).__name__
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        page = context.new_page()
+                    outcomes[i] = result
+                    if result in ("QUERY_ERROR", "INCOMPLETE"):
+                        log.warning("V2 retry pass=%d index=%d reason=%s status=%s",
+                                    retry_round, i + 1, reason, result)
+                    page.wait_for_timeout(300)
+
+            for result in outcomes:
+                yield result
             context.close()
         finally:
             browser.close()
