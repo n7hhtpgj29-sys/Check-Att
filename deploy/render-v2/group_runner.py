@@ -52,11 +52,15 @@ def launch(job_id, employees, shift, work_date, department, employee_names,
     jobs[job_id]={"status":"running","total":len(employees),"done":0,"counts":{},
                   "shift":shift,"department":department,"work_date":work_date,
                   "trigger_type":trigger_type,"scheduled_key":scheduled_key,"results":[],
+                  "scan_progress":{"stage":"starting","checked":0,"total":len(employees),"retry_pending":0},
                   "started_at":datetime.now(timezone.utc).isoformat()}
     def worker():
         counts=Counter()
         try:
-            for employee_no,status in zip(employees,scan_group(employees,shift,work_date)):
+            def progress_callback(**progress):
+                jobs[job_id]["scan_progress"] = progress
+            for employee_no,status in zip(employees,scan_group(
+                    employees,shift,work_date,progress_callback=progress_callback)):
                 if status not in ("SCAN_FOUND","NO_SCAN_IN_WINDOW","INCOMPLETE","QUERY_ERROR"):
                     status="QUERY_ERROR"
                 counts[status]+=1
