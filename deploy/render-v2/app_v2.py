@@ -1034,7 +1034,7 @@ def webhook_retry():
     data=request.get_json(silent=True) or {}
     key=data.get("job_id") if isinstance(data,dict) else None
     if not isinstance(key,str) or not re.fullmatch(
-            r"V2:ALL:[DN]:\\d{4}-\\d{2}-\\d{2}:[a-f0-9-]{36}",key):
+            r"V2:ALL:[DN]:\d{4}-\d{2}-\d{2}:[a-f0-9-]{36}",key):
         return jsonify(error="valid_completed_job_id_required"),400
     try:
         result=dispatch(key)
