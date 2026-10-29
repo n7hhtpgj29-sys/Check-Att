@@ -69,7 +69,7 @@ async function progress(){
   const url=runId?'/api/v2/group-progress/'+runId:'/api/v2/active-group';
   const r=await fetch(url,{headers:headers()});
   const j=await r.json();
-  if(j.status==='idle'&&runId){runId='';sessionStorage.removeItem('v2-run-id')}\n  if(j.status)showJob(j);else out.textContent=JSON.stringify(j,null,2);
+  if(j.status==='idle'&&runId){runId='';sessionStorage.removeItem('v2-run-id')}\n  if(j.status==='idle'){document.getElementById('run-status').textContent='Idle — ไม่มีงานกำลังตรวจ';await auditRoster()}else if(j.status)showJob(j);else out.textContent=JSON.stringify(j,null,2);
  }catch(e){out.textContent='Progress request failed'}
 }
 async function runGroup(){
