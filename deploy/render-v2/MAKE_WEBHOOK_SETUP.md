@@ -1,43 +1,49 @@
-# Attendance V2 → Make.com completion webhook
+# Attendance V2 → One Make Scenario (completion webhook)
 
-## What is already implemented
-- A scheduled V2 job collects the ACTIVE employee roster and runs adaptive retries.
-- After all results are persisted in Supabase, V2 queues one completion event for that invocation.
-- V2 sends a JSON POST to the exact `V2_MAKE_WEBHOOK_URL` configured on the **staging Render service**. Payload contains only:
-  `event, job_id, invocation_id, shift, work_date`. No employee names or admin token are sent.
-- V2 keeps an outbox record and only marks **accepted_by_make** after a 2xx HTTP response.
-- A distinct invocation is generated for each manual Make Run once. Do not deduplicate by day.
-- LINE is not sent directly by the V2 webhook bridge. Make must call /line-delivery-claim, then LINE push, then /line-delivery-ack.
-- If webhook delivery fails, use authenticated `POST /api/v2/webhook-retry` with `{"job_id":"..."}` for a pending job. Inspect `GET /api/v2/webhook-status`.
-- Receipt by Make (2xx) is **not proof** that LINE was delivered.
+## Intended final process
+Attendance V2 scheduler (08:19 D / 20:19 N, Asia/Bangkok)
+→ V2 scans current active roster and retries only unverified employees
+→ persist completed report in Supabase
+→ V2 webhook notifies Make
+→ **one Make scenario** receives event, calls V2 claim API, sends via existing LINE OA, acknowledges success.
 
-## Make configuration required
-Make.com does not combine a daily Schedule trigger and a Custom Webhook trigger inside a single linear scenario. Use two short scenarios, not a long HTTP wait:
+There is no long-running Make HTTP wait and no Repeater.
 
-**A: Existing schedule starter** (Daily 08:19, 20:19 Asia/Bangkok)
-1. Set V2 Admin Token
-2. POST `https://cc-attendance-v2-staging.onrender.com/api/v2/scheduled-run`, body `{}`, header `X-Admin-Token`.
-3. Stop. Remove/disable the old long-wait + LINE modules. This scenario should finish within seconds.
+## Prepared components
+- `scheduler_v2.py`: opt-in scheduler with a unique database slot per date+shift. Only fires in a 20-minute window after scheduled time, never starts when another V2 scan is active.
+- `gunicorn_config.py`: starts scheduler thread in the single Gunicorn worker **only if** `V2_INTERNAL_SCHEDULER_ENABLED=1`.
+- `webhook_bridge.py`: completion event outbox with an HTTPS Make URL; only called after persisted complete run.
+- `GET /api/v2/webhook-status`, `POST /api/v2/webhook-retry`: authenticated operational checks.
+- Original PWA production and original Make v6 are not modified.
 
-**B: Completion receiver** (new Custom Webhook trigger)
-1. Webhooks > Custom Webhook. Create a new hook and copy its full URL privately into Render > Environment > `V2_MAKE_WEBHOOK_URL`.
-2. HTTP: POST `https://cc-attendance-v2-staging.onrender.com/api/v2/line-delivery-claim` with JSON body:
-   `{"job_id":"{{1.job_id}}","invocation_id":"{{1.invocation_id}}","shift":"{{1.shift}}","work_date":"{{1.work_date}}"}`
-   and header `X-Admin-Token` set privately in Make. Map the actual Make output tokens.
-3. Filter: run LINE only if HTTP claim `ready=true` AND `claimed=true` AND `line_message` is present.
-4. HTTP POST `https://api.line.me/v2/bot/message/push` with existing Bot chat LINE OA authorization, recipient and text `{{claim.line_message}}`.
-5. After LINE API reports success, HTTP POST `https://cc-attendance-v2-staging.onrender.com/api/v2/line-delivery-ack`, JSON `{"invocation_id":"{{1.invocation_id}}"}` and X-Admin-Token.
-6. Leave error handling visible; on LINE 429, do not acknowledge as sent. Do not blindly replay accepted webhook events. The claim persists intentionally to avoid duplicate LINE after an uncertain send result.
+## Connect Make before enabling the new scheduler
+1. Import `Attendance_V2_One_Scenario_Webhook_to_LINE.blueprint.json` into a **NEW** Make scenario (do not replace the working v6).
+2. In module 01, create **Webhooks > Custom Webhook** and obtain its live URL.
+3. In module 02 enter the V2 admin token privately and configure module 04 to use the existing LINE OA connection / target group. Verify modules 03 claim and 05 ack map `invocation_id`.
+4. In Render Staging `cc-attendance-v2-staging` Environment set `V2_MAKE_WEBHOOK_URL` to the full HTTPS URL **privately**; do not paste secrets in messages or commit them.
+5. Activate the new Webhook receiver. Check `GET /api/v2/webhook-status` to confirm configured. Perform one deliberate staging test and verify EXACTLY one LINE push and ACK.
+6. **Only after successful test**, disable the legacy v6 schedule in Make. Then set Render Staging Environment `V2_INTERNAL_SCHEDULER_ENABLED=1`.
+7. The old Make v6 remains available but should remain inactive to avoid two schedule sources issuing duplicate scans.
 
-**Safety checklist**
-- Disable the previous Make v6 260-second LINE delivery path before activating the receiver to avoid confusing parallel checks.
-- Configure the webhook URL only in the Render Environment UI; never paste the full hook or admin/LINE tokens into a chat or repository.
-- Test on staging using the current roster and observe webhook-status plus execution logs.
-- If an attendance run is interrupted by Render restart, no completion callback is fired. Fix durable job resumption separately if needed.
-- The webhook feature is **inactive** until `V2_MAKE_WEBHOOK_URL` is set and the Make receiver scenario is enabled.
+## Important operational constraint
+**Render Free web services sleep after inactivity and may restart. In-process scheduler timing is NOT reliable on the Free plan.**
+A dedicated Render Cron Job is better for guaranteed 08:19 and 20:19 starts, but Render documents a minimum $1/month charge per cron job; do not create one without billing approval.
+For production-grade scheduling prefer a Render Cron job or an external reliable scheduler that calls the V2 start endpoint using a securely configured credential. The internal scheduler is only suitable when the web service stays awake and restarts are acceptable.
 
-## Status endpoints
-- GET /api/v2/webhook-status (authenticated): configured, recent outbox rows, attempts and state.
-- POST /api/v2/webhook-retry (authenticated): retry a known pending completed job only.
+## Schedule
+08:19 and 20:19 Asia/Bangkok. The opt-in internal scheduler checks every 25 seconds while the web worker is alive.
+Slots are recorded in `attendance_v2.scheduler_slots`, uniquely by date and shift to reduce duplicates.
+An interrupted run is not automatically replayed; it must be reviewed (avoids accidental duplicate notification).
 
-Production `cc-attendance-iphone-pwa.onrender.com` is not modified.
+## Completion payload (no personal roster data)
+```json
+{"event":"attendance_v2.completed","job_id":"V2:ALL:D:2026-10-29:<uuid>",
+ "invocation_id":"<uuid>","shift":"D","work_date":"2026-10-29"}
+```
+
+## Caveats
+- Webhook status `accepted` means Make acknowledged receipt, **not** that LINE was delivered.
+- Final sending is gated on `ready=true` and `claimed=true`. ACK only after LINE success.
+- No Scan is not a confirmed absence; Query Error and Incomplete never become No Scan.
+- If the job is killed by Render restart before persistence, there is no completion webhook.
+- Make v6 unchanged; do not enable its old schedule together with the new scheduler.
