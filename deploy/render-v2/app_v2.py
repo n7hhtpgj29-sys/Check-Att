@@ -69,6 +69,16 @@ async function progress(){
   const url=runId?'/api/v2/group-progress/'+runId:'/api/v2/active-group';
   const r=await fetch(url,{headers:headers()});
   const j=await r.json();
+  if(r.status===404&&j.error==='job_not_found_or_worker_restarted'){
+   runId='';sessionStorage.removeItem('v2-run-id');
+   const active=await fetch('/api/v2/active-group',{headers:headers()});
+   const live=await active.json();
+   if(active.ok&&live.status!=='idle'&&live.status){showJob(live);return}
+   document.getElementById('run-status').textContent='Idle — งานเก่าไม่อยู่บน Server แล้ว';
+   document.getElementById('run-bar').style.width='0%';
+   document.getElementById('run-detail').textContent='งานเดิมถูกล้างหลัง Server restart; กำลังดูผล Completed ล่าสุดที่บันทึกไว้';
+   await auditRoster();return
+  }
   if(j.status==='idle'&&runId){runId='';sessionStorage.removeItem('v2-run-id')}\n  if(j.status==='idle'){document.getElementById('run-status').textContent='Idle — ไม่มีงานกำลังตรวจ';await auditRoster()}else if(j.status)showJob(j);else out.textContent=JSON.stringify(j,null,2);
  }catch(e){out.textContent='Progress request failed'}
 }
