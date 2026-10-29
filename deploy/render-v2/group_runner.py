@@ -79,6 +79,11 @@ def launch(job_id, employees, shift, work_date, department, employee_names,
                 jobs[job_id]["status"]="completed"
                 try:
                     jobs[job_id]["persisted"]=persist_completed_job(job_id)
+                    if jobs[job_id]["persisted"] and trigger_type == "scheduled":
+                        # Do not block new attendance runs while the webhook is sent.
+                        from webhook_bridge import deliver_after_completion
+                        Thread(target=deliver_after_completion,
+                               args=(dict(jobs[job_id]),),daemon=True).start()
                 except Exception:
                     jobs[job_id]["persisted"]=False
                     jobs[job_id]["storage_error"]=True
