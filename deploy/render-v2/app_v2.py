@@ -48,9 +48,10 @@ async function display(url,opts={}){try{const r=await fetch(url,{...opts,headers
 function sourceProbe(){out.textContent='Testing source (up to 30 seconds)...';display('/api/v2/source-probe',{method:'POST'})}\nfunction testOne(){out.textContent='กำลังอ่านข้อมูล 1 คน โดยไม่ส่ง LINE...';display('/api/v2/test-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({employee_no:document.getElementById('diag-emp').value.trim()})})}\nfunction testBatch(){out.textContent='Testing three scans; please wait...';display('/api/v2/test-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({department:document.getElementById('test-dept').value,shift:document.getElementById('test-shift').value})})}\nlet runId=sessionStorage.getItem('v2-run-id')||'',pollTimer=null;
 function showJob(j){
  if(j.job_id){runId=j.job_id;sessionStorage.setItem('v2-run-id',runId)}
- const done=j.done||0,total=j.total||0;
+ const total=j.total||0,scan=j.scan_progress||{};
+ const done=j.status==='running'?Math.max(j.done||0,scan.checked||0):(j.done||0);
  const pct=total?Math.round(done*100/total):0;
- document.getElementById('run-status').textContent='Run: '+(j.status||'unknown');\n document.getElementById('run-bar').style.width=pct+'%';\n document.getElementById('run-detail').textContent=done+' / '+total+' ('+pct+'%) | '+JSON.stringify(j.counts||{});
+ document.getElementById('run-status').textContent='Run: '+(j.status||'unknown');\n document.getElementById('run-bar').style.width=pct+'%';\n document.getElementById('run-detail').textContent=done+' / '+total+' ('+pct+'%) | '+(j.status==='running'?(scan.stage||'กำลังตรวจ')+' | รอ Retry '+(scan.retry_pending||0)+' คน':JSON.stringify(j.counts||{}));
  if(j.status==='completed' && j.roster_matches_current===false){
   document.getElementById('run-status').textContent='ผลตรวจเก่า — ไม่ตรงทะเบียนล่าสุด';
   document.getElementById('run-detail').textContent='เคยตรวจ '+total+' คน / Active ปัจจุบัน '+j.active_shift_count+' คน — กรุณากดตรวจใหม่';
