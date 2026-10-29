@@ -30,7 +30,7 @@ def home():
 <main><h2>Attendance V2 — Staging</h2><p>Private employee roster and missing candidates. Review all-department no-scan results. LINE requires configuration.</p>
 <label>Admin token (kept in this browser tab only)<input id="token" type="password" autocomplete="off"></label>
 <p><label>กะ <select id="test-shift"><option value="D">Today (D)</option><option value="N">Tonight (N)</option></select></label> <label>วันที่ <input id="work-date" type="date"></label></p>
-<p><button onclick="progress()">ตรวจสถานะปัจจุบัน</button> <button onclick="smokeWebhook()">ทดสอบ Webhook (ไม่ส่ง LINE)</button> <button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="auditRoster()">ตรวจยอดทะเบียน</button> <button onclick="sendLine()">ส่ง LINE</button></p><p><label>ทดสอบการอ่านจากเว็บต้นทาง 1 คน (ไม่ส่ง LINE): <input id="diag-emp" placeholder="EMP NO." maxlength="24" style="max-width:145px"></label> <button type="button" onclick="testOne()">ทดสอบ 1 คน</button></p>
+<p><button onclick="progress()">ตรวจสถานะปัจจุบัน</button> <button onclick="smokeWebhook()">ทดสอบ Webhook (ไม่ส่ง LINE)</button> <button type="button" onclick="runScheduledTest()">ทดสอบ Scheduled Run จริง (ส่ง LINE เมื่อเสร็จ)</button> <button onclick="runGroup()">ตรวจทุกแผนก</button> <button onclick="loadMissing()">สรุปรายชื่อไม่สแกน</button> <button onclick="auditRoster()">ตรวจยอดทะเบียน</button> <button onclick="sendLine()">ส่ง LINE</button></p><p><label>ทดสอบการอ่านจากเว็บต้นทาง 1 คน (ไม่ส่ง LINE): <input id="diag-emp" placeholder="EMP NO." maxlength="24" style="max-width:145px"></label> <button type="button" onclick="testOne()">ทดสอบ 1 คน</button></p>
 <div style="border:1px solid #d5deef;border-radius:10px;padding:14px;margin:14px 0">
 <strong>นำเข้าทะเบียนพนักงาน / Employee Roster</strong><p style="margin:8px 0;font-size:13px">รองรับ CSV: Emp., Name, Dept, SHIFT (DS/NS หรือ D/N)</p>
 <input type="file" id="roster-file" accept=".csv,text/csv" style="width:100%;max-width:100%;box-sizing:border-box">
@@ -82,6 +82,24 @@ async function progress(){
   }
   if(j.status==='idle'&&runId){runId='';sessionStorage.removeItem('v2-run-id')}\n  if(j.status==='idle'){document.getElementById('run-status').textContent='Idle — ไม่มีงานกำลังตรวจ';await auditRoster()}else if(j.status)showJob(j);else out.textContent=JSON.stringify(j,null,2);
  }catch(e){out.textContent='Progress request failed'}
+}
+async function runScheduledTest(){
+ const s=document.getElementById('test-shift').value;
+ const day=document.getElementById('work-date').value;
+ if(!confirm('เริ่มตรวจพนักงาน Active กะ '+s+' วันที่ '+day+' จริง? เมื่อ Completed จะส่ง Webhook ไป Make และอาจส่ง LINE OA 1 ข้อความ กรุณาตรวจว่า Make Scenario ใหม่ Active และ v6 เดิมไม่กำลังรันอยู่'))return;
+ out.textContent='กำลังเริ่ม Scheduled Run จริง...';
+ try{
+  const r=await fetch('/api/v2/scheduled-run',{method:'POST',
+   headers:{...headers(),'Content-Type':'application/json'},
+   body:JSON.stringify({shift:s,work_date:day})});
+  const j=await r.json();
+  if(!r.ok){out.textContent='เริ่มงานไม่สำเร็จ ('+r.status+'): '+JSON.stringify(j,null,2);return}
+  runId='';sessionStorage.removeItem('v2-run-id');
+  out.textContent='เริ่มตรวจ '+j.total+' คนแล้ว | กะ '+j.shift+' | '+j.work_date+
+   '\\nเมื่อ Completed และบันทึก Supabase สำเร็จ V2 จะส่ง Webhook ให้ Make โดยอัตโนมัติ'+
+   '\\nInvocation ID: '+j.invocation_id;
+  await progress();
+ }catch(e){out.textContent='เรียก Scheduled Run ไม่สำเร็จ: '+e.message}
 }
 async function runGroup(){
  const d='ALL',s=document.getElementById('test-shift').value;
