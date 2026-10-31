@@ -135,6 +135,7 @@ def scan_group(ids, shift, work_date, progress_callback=None, result_callback=No
             allow_reuse = True
             reuse_failures = 0
             times = []
+            consecutive_source_timeouts = 0
             # First pass: fast AJAX query where verified, then fresh-page retry.
             # Never synthesize QUERY_ERROR for people not yet queried.
             for i, employee_no in enumerate(ids):
@@ -169,6 +170,10 @@ def scan_group(ids, shift, work_date, progress_callback=None, result_callback=No
                             allow_reuse = False
                     if attempt == 0:
                         page.wait_for_timeout(350)
+                if result=="QUERY_ERROR" and reason=="TimeoutError":
+                    consecutive_source_timeouts += 1
+                else:
+                    consecutive_source_timeouts = 0
                 outcomes[i] = result
                 if result_callback:
                     result_callback(employee_no,result,"first_pass")
@@ -184,11 +189,25 @@ def scan_group(ids, shift, work_date, progress_callback=None, result_callback=No
                     log.info("V2 first pass %d/%d avg_last_10=%.2fs pending=%d",
                              i + 1, len(ids), sum(recent)/len(recent),
                              sum(s in ("QUERY_ERROR", "INCOMPLETE") for s in outcomes[:i+1]))
+                if consecutive_source_timeouts >= 6:
+                    # Do not wait hours on a source that cannot load. These are
+                    # explicitly unverified QUERY_ERROR, never 'No Scan'.
+                    log.error("V2 source outage: %d consecutive navigation timeouts; unqueried employees remain QUERY_ERROR",
+                              consecutive_source_timeouts)
+                    for remaining_index in range(i+1,len(ids)):
+                        if outcomes[remaining_index] in ("SCAN_FOUND","NO_SCAN_IN_WINDOW"):
+                            continue
+                        outcomes[remaining_index]="QUERY_ERROR"
+                        if result_callback:
+                            result_callback(ids[remaining_index],"QUERY_ERROR","source_unavailable_not_queried")
+                    break
                 page.wait_for_timeout(120)
 
             # Second phase: retry ONLY unverified employees using a fresh page.
             # No successful employee is queried again within this job.
-            for retry_round in (1, 2):
+            if consecutive_source_timeouts >= 6:
+                log.error("V2 skipping retry passes because the attendance source is unavailable")
+            for retry_round in (() if consecutive_source_timeouts >= 6 else (1, 2)):
                 pending = [i for i, status in enumerate(outcomes)
                            if status in ("QUERY_ERROR", "INCOMPLETE")]
                 if not pending:
