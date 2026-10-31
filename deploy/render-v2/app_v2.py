@@ -1047,6 +1047,19 @@ def webhook_smoke_test():
         return jsonify(error="make_webhook_unreachable"),502
 
 
+@app.get("/api/v2/run-health")
+@secure
+def run_health():
+    """Read durable job checkpoints, including interrupted/failed runs."""
+    from checkpoint_store import recent_health
+    try:
+        rows=recent_health()
+        return jsonify(jobs=rows,needs_attention=sum(x["state"]=="needs_attention" for x in rows))
+    except Exception:
+        app.logger.exception("V2 durable run health query failed")
+        return jsonify(error="run_health_database_unavailable"),503
+
+
 @app.get("/api/v2/webhook-status")
 @secure
 def webhook_status():
