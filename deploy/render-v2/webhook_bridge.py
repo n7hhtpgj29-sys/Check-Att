@@ -123,3 +123,41 @@ def deliver_after_completion(job):
         dispatch(job["scheduled_key"])
     except Exception:
         log.exception("V2 webhook dispatch could not complete")
+
+
+def reconcile_completed(max_jobs=8):
+    """Recover pending completion notifications after a Render worker restart.
+
+    This checks ONLY already completed scheduled reports with no prior
+    webhook acknowledgement. The Make-side claim still prevents duplicate LINE.
+    """
+    if not configured_webhook():
+        return {"scanned":0,"reason":"webhook_not_configured"}
+    with database() as db:
+        with db.cursor() as cur:
+            ensure_outbox(cur)
+            cur.execute("""
+                SELECT r.scheduled_key,r.shift,r.work_date
+                FROM attendance_v2.attendance_runs r
+                JOIN attendance_v2.departments d ON d.id=r.department_id
+                LEFT JOIN attendance_v2.webhook_outbox o
+                     ON o.job_key=r.scheduled_key
+                WHERE r.trigger_type='scheduled'
+                  AND r.status='completed'
+                  AND d.code='ALL'
+                  AND r.scheduled_key IS NOT NULL
+                  AND r.finished_at > now()-interval '2 days'
+                  AND (o.job_key IS NULL OR o.state='pending')
+                ORDER BY r.finished_at DESC LIMIT %s
+            """,(max_jobs,))
+            rows=cur.fetchall()
+    delivered=0
+    for key,shift,day in rows:
+        try:
+            enqueue({"trigger_type":"scheduled","scheduled_key":key,
+                     "shift":shift,"work_date":str(day)})
+            status=dispatch(key)
+            delivered+=int(status.get("sent",False))
+        except Exception:
+            log.exception("V2 completed webhook reconciliation failed")
+    return {"scanned":len(rows),"accepted":delivered}
