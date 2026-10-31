@@ -140,13 +140,15 @@ def reconcile_completed(max_jobs=8):
                 SELECT r.scheduled_key,r.shift,r.work_date
                 FROM attendance_v2.attendance_runs r
                 JOIN attendance_v2.departments d ON d.id=r.department_id
+                JOIN attendance_v2.scan_checkpoints c
+                     ON c.scheduled_key=r.scheduled_key AND c.state='completed'
                 LEFT JOIN attendance_v2.webhook_outbox o
                      ON o.job_key=r.scheduled_key
                 WHERE r.trigger_type='scheduled'
                   AND r.status='completed'
                   AND d.code='ALL'
                   AND r.scheduled_key IS NOT NULL
-                  AND r.finished_at > now()-interval '2 days'
+                  AND r.finished_at > now()-interval '6 hours'
                   AND (o.job_key IS NULL OR o.state='pending')
                 ORDER BY r.finished_at DESC LIMIT %s
             """,(max_jobs,))
