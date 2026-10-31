@@ -106,7 +106,7 @@ def _one_query(page, employee_no, shift, day, refresh_page=True, read_timeout=7)
     return "INCOMPLETE", "SHIFT_NOT_STARTED"
 
 
-def scan_group(ids, shift, work_date, progress_callback=None):
+def scan_group(ids, shift, work_date, progress_callback=None, result_callback=None, resumed=None):
     """Yield exactly one of the four existing statuses for every employee.
 
     The job runner persists no-scan reports only when the entire query is
@@ -114,7 +114,8 @@ def scan_group(ids, shift, work_date, progress_callback=None):
     """
     day = datetime.strptime(work_date, "%Y-%m-%d").date()
     # Keep a result slot for every employee until all retry passes complete.
-    outcomes = ["INCOMPLETE"] * len(ids)
+    restored = resumed or {}
+    outcomes = [restored.get(emp) if restored.get(emp) in ("SCAN_FOUND","NO_SCAN_IN_WINDOW") else "INCOMPLETE" for emp in ids]
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=False,
@@ -137,6 +138,11 @@ def scan_group(ids, shift, work_date, progress_callback=None):
             # First pass: fast AJAX query where verified, then fresh-page retry.
             # Never synthesize QUERY_ERROR for people not yet queried.
             for i, employee_no in enumerate(ids):
+                if restored.get(employee_no) in ("SCAN_FOUND","NO_SCAN_IN_WINDOW"):
+                    if progress_callback:
+                        progress_callback(stage="first_pass",checked=i+1,total=len(ids),
+                            retry_pending=sum(x in ("QUERY_ERROR","INCOMPLETE") for x in outcomes[:i+1]))
+                    continue
                 started = time.monotonic()
                 result, reason = "INCOMPLETE", "NO_VERIFIED_ROWS"
                 for attempt in range(2):
@@ -164,6 +170,8 @@ def scan_group(ids, shift, work_date, progress_callback=None):
                     if attempt == 0:
                         page.wait_for_timeout(350)
                 outcomes[i] = result
+                if result_callback:
+                    result_callback(employee_no,result,"first_pass")
                 if progress_callback:
                     progress_callback(stage="first_pass", checked=i + 1,
                                       total=len(ids), retry_pending=sum(s in ("QUERY_ERROR", "INCOMPLETE") for s in outcomes[:i+1]))
@@ -205,6 +213,8 @@ def scan_group(ids, shift, work_date, progress_callback=None):
                             pass
                         page = context.new_page()
                     outcomes[i] = result
+                    if result_callback:
+                        result_callback(employee_no,result,"retry_"+str(retry_round))
                     if result in ("QUERY_ERROR", "INCOMPLETE"):
                         log.warning("V2 retry pass=%d index=%d reason=%s status=%s",
                                     retry_round, i + 1, reason, result)
